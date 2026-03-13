@@ -1,0 +1,21 @@
+# Core image/document handling (already in layoutparser requirements)
+Pillow>=9.0.0
+numpy>=1.21.0
+opencv-python>=4.5.0
+
+# OCR (requires Tesseract binary – see README)
+pytesseract>=0.3.10
+
+# Language detection (fully offline, statistical)
+langdetect>=1.0.9
+
+# Translation – fully local / offline neural MT
+# Models (~100 MB each) are downloaded once on first use, then cached on disk.
+argostranslate>=1.9.0
+
+# PDF loading (requires Poppler binaries – see README)
+pdf2image>=1.16.0
+
+# Optional: correct RTL text rendering (Arabic, Hebrew, Persian, Urdu)
+# arabic-reshaper>=3.0.0
+# python-bidi>=0.4.2
