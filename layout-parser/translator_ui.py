@@ -75,7 +75,18 @@ SOURCE_LANGUAGES = [("Auto-detect", "auto")] + TARGET_LANGUAGES
 
 # Default paths
 _DEFAULT_TESSERACT = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-_DEFAULT_POPPLER   = r"C:\Users\migne\Desktop\DEBlock\Translation tool google lens like\poppler-25.12.0\Library\bin"
+
+def _find_default_poppler() -> str:
+    """Locate the poppler bin directory relative to this script."""
+    base = Path(__file__).resolve().parent.parent  # project root
+    for child in base.iterdir():
+        if child.is_dir() and child.name.lower().startswith("poppler"):
+            bin_dir = child / "Library" / "bin"
+            if bin_dir.is_dir():
+                return str(bin_dir)
+    return ""
+
+_DEFAULT_POPPLER = _find_default_poppler()
 
 
 # ---------------------------------------------------------------------------

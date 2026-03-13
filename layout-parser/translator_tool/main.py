@@ -28,10 +28,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "-t", "--target",
-        required=True,
+        default="en",
         metavar="LANG",
         dest="target_lang",
-        help=f"Target language code. Examples: {_EXAMPLE_LANGS}",
+        help=f"Target language code (default: en). Examples: {_EXAMPLE_LANGS}",
     )
     p.add_argument(
         "-s", "--source",

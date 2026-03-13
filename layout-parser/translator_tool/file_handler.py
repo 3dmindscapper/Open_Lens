@@ -46,6 +46,18 @@ def load_document(input_path: str) -> List[Image.Image]:
         )
 
 
+def _find_bundled_poppler() -> Optional[str]:
+    """Locate the poppler bin directory bundled with the project."""
+    # Walk up from this file to find poppler-*/Library/bin
+    base = Path(__file__).resolve().parent.parent.parent  # project root
+    for child in base.iterdir():
+        if child.is_dir() and child.name.lower().startswith("poppler"):
+            bin_dir = child / "Library" / "bin"
+            if bin_dir.is_dir():
+                return str(bin_dir)
+    return None
+
+
 def _load_pdf(pdf_path: str) -> List[Image.Image]:
     """Convert each page of a PDF to a PIL Image at 200 DPI."""
     try:
@@ -60,7 +72,12 @@ def _load_pdf(pdf_path: str) -> List[Image.Image]:
             "  Linux:   sudo apt-get install poppler-utils"
         )
 
-    images = convert_from_path(pdf_path, dpi=200)
+    poppler_path = _find_bundled_poppler()
+    kwargs = {"dpi": 200}
+    if poppler_path:
+        kwargs["poppler_path"] = poppler_path
+
+    images = convert_from_path(pdf_path, **kwargs)
     return [img.convert("RGB") for img in images]
 
 
