@@ -34,7 +34,7 @@ Multi-page PDFs are converted page-by-page at 200 DPI, processed individually, a
 Python dependencies (installed via pip):
 
 ```
-pip install -r layout-parser/requirements_translator.txt
+pip install -r Open_Lens_Core/requirements_translator.txt
 ```
 
 Key packages: `Pillow`, `numpy`, `opencv-python`, `pytesseract`, `langdetect`, `argostranslate`, `pdf2image`.
@@ -48,7 +48,7 @@ Optional for RTL languages: `arabic-reshaper`, `python-bidi`.
 Double-click **Launch Translator.bat** or run:
 
 ```bash
-cd layout-parser
+cd Open_Lens_Core
 python translator_ui.py
 ```
 
@@ -57,7 +57,7 @@ The GUI defaults to translating to **English** with automatic source language de
 ### Command Line
 
 ```bash
-cd layout-parser
+cd Open_Lens_Core
 
 # Translate a PDF to English (auto-detect source language)
 python translate.py document.pdf -t en
@@ -86,7 +86,7 @@ python translate.py invoice.png -t es --tesseract "C:\Program Files\Tesseract-OC
 Open_Lens/
 ├── Launch Translator.bat          # Windows launcher for the GUI
 ├── README.md                      # This file
-├── layout-parser/
+├── Open_Lens_Core/
 │   ├── translate.py               # CLI entry point
 │   ├── translator_ui.py           # Tkinter GUI
 │   ├── requirements_translator.txt
@@ -108,6 +108,69 @@ The tool supports 35+ languages including English, French, German, Spanish, Ital
 
 Translation between any pair is handled directly if a model exists, or via English as a pivot language.
 
+
+
+## Web Server / Frontend Integration
+
+The translation pipeline exposes a single callable that is easy to wrap in an HTTP server, making it straightforward to connect to a frontend or an agent workflow that uploads documents for translation.
+
+### FastAPI example
+
+Install the server dependency: `pip install fastapi uvicorn python-multipart`
+
+Create `server.py` alongside `translator_ui.py` inside your folder:
+
+```python
+import os, uuid
+from pathlib import Path
+from fastapi import FastAPI, UploadFile, Form
+from fastapi.responses import FileResponse
+import sys
+sys.path.insert(0, str(Path(__file__).parent))
+
+from translator_tool.pipeline import process_document
+
+app = FastAPI()
+UPLOAD_DIR = Path("uploads")
+UPLOAD_DIR.mkdir(exist_ok=True)
+
+@app.post("/translate")
+async def translate(file: UploadFile, target_lang: str = Form(default="en")):
+    suffix = Path(file.filename).suffix
+    job_id = uuid.uuid4().hex
+    in_path  = UPLOAD_DIR / f"{job_id}_in{suffix}"
+    out_path = UPLOAD_DIR / f"{job_id}_out{suffix}"
+
+    in_path.write_bytes(await file.read())
+
+    process_document(
+        input_path=str(in_path),
+        target_lang=target_lang,
+        output_path=str(out_path),
+    )
+
+    return FileResponse(str(out_path), filename=f"translated_{file.filename}")
+```
+
+Start the server:
+
+```bash
+cd <your-folder>
+uvicorn server:app --host 0.0.0.0 --port 8000
+```
+
+Your frontend or agent POSTs a `multipart/form-data` upload to `http://localhost:8000/translate` and receives the translated file directly in the response.
+
+### Production considerations
+
+| Topic | Notes |
+|---|---|
+| **Long processing times** | A multi-page PDF can take 30–120 seconds. Use a task queue (Celery + Redis) so the endpoint returns a job ID immediately and the client polls for the result instead of holding a long connection open. |
+| **Concurrency** | The pipeline is CPU-heavy. Run jobs in a thread pool (`asyncio.run_in_executor`) and set `--workers N` in uvicorn to match your CPU count. |
+| **File cleanup** | Delete temporary upload/output files after download, or sweep them on a schedule. |
+| **First-run model download** | Argos Translate downloads ~100 MB language models on first use per language pair. Pre-warm them at server startup or bake them into your deployment environment so the first request does not time out. |
+| **Tesseract & Poppler** | Both must be available in the server environment. Poppler is auto-detected from the bundled `poppler-*/Library/bin` folder relative to the project — no PATH configuration needed. |
+
 ## License
 
-See [layout-parser/LICENSE](layout-parser/LICENSE).
+See [Open_Lens_Core/LICENSE](Open_Lens_Core/LICENSE).
