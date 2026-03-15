@@ -116,6 +116,7 @@ def process_document(
     tesseract_cmd: Optional[str] = None,
     font_path: Optional[str] = None,
     verbose: bool = True,
+    log_callback: Optional[Callable[[str], Any]] = None,
 ) -> str:
     """Translate all text in a document file and save the result.
 
@@ -129,12 +130,16 @@ def process_document(
         tesseract_cmd: Override path to Tesseract binary.
         font_path:     Override path to a TrueType font file.
         verbose:       Print progress messages.
+        log_callback:  Optional callable that receives each log message.
+                       When provided, overrides the built-in print logging.
 
     Returns:
         Path to the saved output file (or directory for multi-page images).
     """
     def log(msg: str):
-        if verbose:
+        if log_callback is not None:
+            log_callback(msg)
+        elif verbose:
             print(msg)
 
     input_path = str(input_path)

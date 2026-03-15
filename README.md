@@ -43,7 +43,18 @@ Optional for RTL languages: `arabic-reshaper`, `python-bidi`.
 
 ## Quick Start
 
-### GUI
+### Web Server (share with any device on your network)
+
+Double-click **Launch Web Server.bat** or run:
+
+```bash
+cd Open_Lens_Core
+python web_app.py
+```
+
+Open the printed Network URL (`http://192.168.x.x:5000`) on any device connected to the same Wi-Fi or LAN — no installation needed on remote devices.
+
+### Desktop GUI
 
 Double-click **Launch Translator.bat** or run:
 
@@ -84,11 +95,13 @@ python translate.py invoice.png -t es --tesseract "C:\Program Files\Tesseract-OC
 
 ```
 Open_Lens/
-├── Launch Translator.bat          # Windows launcher for the GUI
+├── Launch Translator.bat          # Windows launcher for the desktop GUI
+├── Launch Web Server.bat          # Windows launcher for the web server
 ├── README.md                      # This file
 ├── Open_Lens_Core/
 │   ├── translate.py               # CLI entry point
 │   ├── translator_ui.py           # Tkinter GUI
+│   ├── web_app.py                 # Flask web server (LAN-accessible)
 │   ├── requirements_translator.txt
 │   └── translator_tool/           # Core library
 │       ├── __init__.py
@@ -108,68 +121,50 @@ The tool supports 35+ languages including English, French, German, Spanish, Ital
 
 Translation between any pair is handled directly if a model exists, or via English as a pivot language.
 
+## Web Server — Share Over Your Network
 
+`web_app.py` is a fully self-contained Flask web server. Once running, **any phone, tablet, or PC on the same Wi-Fi or LAN** can open a browser, upload a document, and download the translated version — no installation required on the remote device.
 
-## Web Server / Frontend Integration
+### Starting the server
 
-The translation pipeline exposes a single callable that is easy to wrap in an HTTP server, making it straightforward to connect to a frontend or an agent workflow that uploads documents for translation.
-
-### FastAPI example
-
-Install the server dependency: `pip install fastapi uvicorn python-multipart`
-
-Create `server.py` alongside `translator_ui.py` inside your folder:
-
-```python
-import os, uuid
-from pathlib import Path
-from fastapi import FastAPI, UploadFile, Form
-from fastapi.responses import FileResponse
-import sys
-sys.path.insert(0, str(Path(__file__).parent))
-
-from translator_tool.pipeline import process_document
-
-app = FastAPI()
-UPLOAD_DIR = Path("uploads")
-UPLOAD_DIR.mkdir(exist_ok=True)
-
-@app.post("/translate")
-async def translate(file: UploadFile, target_lang: str = Form(default="en")):
-    suffix = Path(file.filename).suffix
-    job_id = uuid.uuid4().hex
-    in_path  = UPLOAD_DIR / f"{job_id}_in{suffix}"
-    out_path = UPLOAD_DIR / f"{job_id}_out{suffix}"
-
-    in_path.write_bytes(await file.read())
-
-    process_document(
-        input_path=str(in_path),
-        target_lang=target_lang,
-        output_path=str(out_path),
-    )
-
-    return FileResponse(str(out_path), filename=f"translated_{file.filename}")
-```
-
-Start the server:
+Double-click **Launch Web Server.bat**, or run manually:
 
 ```bash
-cd <your-folder>
-uvicorn server:app --host 0.0.0.0 --port 8000
+cd Open_Lens_Core
+python web_app.py
 ```
 
-Your frontend or agent POSTs a `multipart/form-data` upload to `http://localhost:8000/translate` and receives the translated file directly in the response.
+The console prints two URLs:
 
-### Production considerations
+```
+  Local:    http://localhost:5000
+  Network:  http://192.168.x.x:5000   ← share this with other devices
+```
 
-| Topic | Notes |
-|---|---|
-| **Long processing times** | A multi-page PDF can take 30–120 seconds. Use a task queue (Celery + Redis) so the endpoint returns a job ID immediately and the client polls for the result instead of holding a long connection open. |
-| **Concurrency** | The pipeline is CPU-heavy. Run jobs in a thread pool (`asyncio.run_in_executor`) and set `--workers N` in uvicorn to match your CPU count. |
-| **File cleanup** | Delete temporary upload/output files after download, or sweep them on a schedule. |
-| **First-run model download** | Argos Translate downloads ~100 MB language models on first use per language pair. Pre-warm them at server startup or bake them into your deployment environment so the first request does not time out. |
-| **Tesseract & Poppler** | Both must be available in the server environment. Poppler is auto-detected from the bundled `poppler-*/Library/bin` folder relative to the project — no PATH configuration needed. |
+Open the **Network** URL on any device connected to the same network. The web UI lets you:
+
+1. Drag-and-drop (or browse) a file — PDF, JPG, PNG, TIFF, BMP, or WebP (up to 100 MB)
+2. Pick source and target languages (auto-detect available)
+3. Click **Translate** and watch live progress logs stream in the browser
+4. Click **Download** when done — multi-page results are automatically bundled into a ZIP
+
+Uploaded and output files are **automatically deleted after 10 minutes**.
+
+### Making it reachable from outside your LAN
+
+By default the server only works on your local network. To expose it over the internet:
+
+- **Port forward** port `5000` on your router to the host machine, **or**
+- Use a tunnel tool such as [ngrok](https://ngrok.com/): `ngrok http 5000` — this gives you a public HTTPS URL instantly with no router changes.
+
+### Changing the port
+
+Set the `PORT` environment variable before launching:
+
+```bash
+set PORT=8080
+python web_app.py
+```
 
 ## License
 

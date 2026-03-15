@@ -16,6 +16,9 @@ argostranslate>=1.9.0
 # PDF loading (requires Poppler binaries – see README)
 pdf2image>=1.16.0
 
+# Web server (used by web_app.py to host the translator for other devices)
+flask>=3.0.0
+
 # Optional: correct RTL text rendering (Arabic, Hebrew, Persian, Urdu)
 # arabic-reshaper>=3.0.0
 # python-bidi>=0.4.2
