@@ -43,18 +43,7 @@ Optional for RTL languages: `arabic-reshaper`, `python-bidi`.
 
 ## Quick Start
 
-### Web Server (share with any device on your network)
-
-Double-click **Launch Web Server.bat** or run:
-
-```bash
-cd Open_Lens_Core
-python web_app.py
-```
-
-Open the printed Network URL (`http://192.168.x.x:5000`) on any device connected to the same Wi-Fi or LAN — no installation needed on remote devices.
-
-### Desktop GUI
+### GUI
 
 Double-click **Launch Translator.bat** or run:
 
