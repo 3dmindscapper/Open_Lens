@@ -27,6 +27,14 @@ def _has_layoutparser() -> bool:
         return False
 
 
+def _has_easyocr() -> bool:
+    try:
+        import easyocr  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
 def _has_paddleocr() -> bool:
     try:
         from paddleocr import PaddleOCR  # noqa: F401
@@ -80,7 +88,7 @@ class TranslationConfig:
 
     # --- backend selection (auto | specific name) --------------------------
     layout_engine: str = "auto"       # "layoutparser" | "paddleocr" | "none"
-    ocr_engine: str = "auto"          # "paddleocr" | "tesseract"
+    ocr_engine: str = "auto"          # "easyocr" | "paddleocr" | "tesseract"
     inpaint_engine: str = "auto"      # "lama" | "telea"
     translator_engine: str = "auto"   # "argos" | "ollama"
 
@@ -128,7 +136,9 @@ class TranslationConfig:
 
         # OCR engine
         if self.ocr_engine == "auto":
-            if _has_paddleocr():
+            if _has_easyocr():
+                self.ocr_engine = "easyocr"
+            elif _has_paddleocr():
                 self.ocr_engine = "paddleocr"
             elif _has_tesseract():
                 self.ocr_engine = "tesseract"

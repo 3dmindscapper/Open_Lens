@@ -328,9 +328,9 @@ def render_translated_blocks(
         # --- Line spacing ---
         original_spacing = measure_line_spacing(block)
 
-        # Allow up to 60% extra height for longer translations
-        fit_h = int(h * 1.6)
-        min_font = max(6, int(estimated_size * 0.70)) if estimated_size else 6
+        # Allow only a small overflow to prevent overlapping into adjacent blocks
+        fit_h = int(h * 1.15)
+        min_font = max(6, int(estimated_size * 0.50)) if estimated_size else 6
         font, lines, font_size = _fit_font(
             display_text, w, fit_h, active_font_path,
             min_size=min_font, max_size=estimated_size,
@@ -352,7 +352,8 @@ def render_translated_blocks(
         else:
             current_y = y
 
-        overflow_limit = y + h + int(h * 0.6)
+        # Hard limit: never draw beyond 15% past the block bottom edge
+        overflow_limit = y + h + int(h * 0.15)
 
         for line in lines:
             if current_y + glyph_h > overflow_limit:

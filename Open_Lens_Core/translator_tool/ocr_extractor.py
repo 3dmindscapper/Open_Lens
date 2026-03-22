@@ -1,10 +1,11 @@
 """
 OCR extraction module.
 
-Supports two engines:
-  - **PaddleOCR** (default when available): superior detection on complex
-    backgrounds, tighter bounding boxes, 80+ languages.
-  - **Tesseract** (fallback): via pytesseract, requires Tesseract binary.
+Supports three engines (auto-selected in priority order):
+  1. **EasyOCR** (preferred): PyTorch-based, 80+ languages, tight bounding
+     boxes, robust on complex backgrounds.
+  2. **PaddleOCR**: PaddlePaddle-based, 80+ languages.
+  3. **Tesseract** (fallback): via pytesseract, requires Tesseract binary.
 
 The public API (``extract_text_blocks``, ``extract_full_text``) auto-selects
 the best available engine unless the caller specifies one explicitly.
@@ -24,6 +25,45 @@ import pandas as pd
 from PIL import Image
 
 log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Pre-OCR image enhancement
+# ---------------------------------------------------------------------------
+
+def _enhance_for_ocr(img_np: np.ndarray) -> np.ndarray:
+    """Enhance an image for better Tesseract accuracy.
+
+    Suppresses light watermarks / stamps and enhances text contrast by:
+      1. Converting to grayscale.
+      2. Applying CLAHE to boost local contrast.
+      3. Using adaptive thresholding to produce a clean binary image.
+
+    Returns a grayscale numpy array suitable for Tesseract.
+    """
+    import cv2
+
+    if img_np.ndim == 3:
+        gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+    else:
+        gray = img_np.copy()
+
+    # CLAHE: boost local contrast without blowing out bright areas
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(gray)
+
+    # Adaptive threshold: suppresses light watermarks and stamps while
+    # preserving dark body text.  Block size must be large enough to
+    # capture local background variation.
+    binary = cv2.adaptiveThreshold(
+        enhanced, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        blockSize=31,
+        C=15,
+    )
+
+    return binary
 
 
 # ---------------------------------------------------------------------------
@@ -98,7 +138,7 @@ def _raw_ocr_dataframe(image_np: np.ndarray, ocr_lang: str) -> pd.DataFrame:
 def extract_text_blocks(
     image: Image.Image,
     ocr_lang: str = "eng",
-    min_confidence: float = 20.0,
+    min_confidence: float = 30.0,
     min_text_length: int = 2,
 ) -> List[TextBlock]:
     """Extract paragraph-level text blocks with bounding boxes via Tesseract.
@@ -362,6 +402,13 @@ def extract_full_text(image: Image.Image, ocr_lang: str = "eng",
     if engine == "auto":
         engine = _pick_engine()
 
+    if engine == "easyocr":
+        try:
+            blocks = _extract_easyocr(image, ocr_lang)
+            return " ".join(b["text"] for b in blocks if b.get("text"))
+        except Exception:
+            pass  # fall through to Tesseract
+
     if engine == "paddleocr":
         blocks = _extract_paddle(image, ocr_lang)
         return " ".join(b["text"] for b in blocks if b.get("text"))
@@ -472,6 +519,107 @@ def _extract_paddle(
     return blocks
 
 
+# ---------------------------------------------------------------------------
+# EasyOCR engine
+# ---------------------------------------------------------------------------
+
+_EASYOCR_CACHE: Dict[str, Any] = {}
+
+# Tesseract lang code → EasyOCR lang code(s)
+_TESS_TO_EASYOCR: Dict[str, List[str]] = {
+    "eng": ["en"], "fra": ["fr"], "deu": ["de"], "spa": ["es"],
+    "ita": ["it"], "por": ["pt"], "nld": ["nl"], "rus": ["ru"],
+    "chi_sim": ["ch_sim"], "chi_tra": ["ch_tra"], "jpn": ["ja"],
+    "kor": ["ko"], "ara": ["ar"], "hin": ["hi"], "tur": ["tr"],
+    "pol": ["pl"], "ukr": ["uk"], "vie": ["vi"], "tha": ["th"],
+    "tam": ["ta"], "tel": ["te"], "kan": ["kn"], "mar": ["mr"],
+    "ben": ["bn"], "nep": ["ne"], "urd": ["ur"], "fas": ["fa"],
+    "heb": ["he"], "swe": ["sv"], "nor": ["no"], "dan": ["da"],
+    "fin": ["fi"], "ces": ["cs"], "ron": ["ro"], "hun": ["hu"],
+    "bul": ["bg"], "hrv": ["hr"], "slk": ["sk"], "slv": ["sl"],
+    "srp": ["rs_latin"], "cat": ["ca"], "ell": ["el"],
+    "lat": ["la"], "ind": ["id"], "msa": ["ms"],
+}
+
+
+def _tesseract_to_easyocr_langs(tess_lang: str) -> List[str]:
+    """Map Tesseract language code to EasyOCR language code(s)."""
+    parts = tess_lang.split("+")
+    result = []
+    for p in parts:
+        p = p.strip()
+        mapped = _TESS_TO_EASYOCR.get(p, ["en"])
+        for lang in mapped:
+            if lang not in result:
+                result.append(lang)
+    return result or ["en"]
+
+
+def _get_easyocr_reader(langs: List[str], device: str = "cpu"):
+    """Return a cached EasyOCR Reader instance."""
+    key = "_".join(sorted(langs)) + f"_{device}"
+    if key in _EASYOCR_CACHE:
+        return _EASYOCR_CACHE[key]
+
+    import easyocr  # type: ignore
+
+    gpu = device != "cpu"
+    reader = easyocr.Reader(langs, gpu=gpu, verbose=False)
+    _EASYOCR_CACHE[key] = reader
+    log.info("EasyOCR reader loaded: langs=%s device=%s", langs, device)
+    return reader
+
+
+def _extract_easyocr(
+    image: Image.Image,
+    ocr_lang: str = "eng",
+    min_confidence: float = 0.3,
+    device: str = "cpu",
+) -> List[TextBlock]:
+    """Extract text blocks using EasyOCR."""
+    langs = _tesseract_to_easyocr_langs(ocr_lang)
+    reader = _get_easyocr_reader(langs, device)
+    img_np = np.array(image)
+
+    # EasyOCR returns: [[box, text, conf], ...]
+    # where box = [[x1,y1], [x2,y1], [x2,y2], [x1,y2]]
+    results = reader.readtext(img_np, paragraph=False)
+
+    if not results:
+        return []
+
+    raw_lines: List[TextBlock] = []
+    for detection in results:
+        box_pts, text, conf = detection
+        text = text.strip()
+        if not text or conf < min_confidence:
+            continue
+
+        xs = [pt[0] for pt in box_pts]
+        ys = [pt[1] for pt in box_pts]
+        x1, y1 = int(min(xs)), int(min(ys))
+        x2, y2 = int(max(xs)), int(max(ys))
+
+        if x2 <= x1 or y2 <= y1:
+            continue
+
+        raw_lines.append({
+            "x": x1, "y": y1, "w": x2 - x1, "h": y2 - y1,
+            "x2": x2, "y2": y2,
+            "text": text,
+            "mean_conf": float(conf * 100),
+            "word_boxes": [{"x": x1, "y": y1, "w": x2 - x1, "h": y2 - y1,
+                            "x2": x2, "y2": y2, "text": text}],
+        })
+
+    if not raw_lines:
+        return []
+
+    blocks = _merge_lines_into_blocks(raw_lines, image.size[0])
+    blocks = _split_wide_blocks(blocks, image.size[0])
+    return blocks
+
+
 def _merge_lines_into_blocks(
     lines: List[TextBlock],
     img_width: int,
@@ -524,6 +672,11 @@ def _merge_lines_into_blocks(
 def _pick_engine() -> str:
     """Auto-select OCR engine based on availability."""
     try:
+        import easyocr  # noqa: F401
+        return "easyocr"
+    except Exception:
+        pass
+    try:
         from paddleocr import PaddleOCR  # noqa: F401
         return "paddleocr"
     except Exception:
@@ -557,7 +710,14 @@ def extract_text_blocks_unified(
     if engine == "auto":
         engine = _pick_engine()
 
-    if engine == "paddleocr":
+    if engine == "easyocr":
+        try:
+            easyocr_conf = min_confidence / 100.0 if min_confidence > 1 else min_confidence
+            blocks = _extract_easyocr(image, ocr_lang, min_confidence=easyocr_conf, device=device)
+        except Exception as exc:
+            log.warning("EasyOCR failed (%s), falling back to Tesseract", exc)
+            blocks = extract_text_blocks(image, ocr_lang, min_confidence, min_text_length)
+    elif engine == "paddleocr":
         try:
             paddle_conf = min_confidence / 100.0 if min_confidence > 1 else min_confidence
             blocks = _extract_paddle(image, ocr_lang, min_confidence=paddle_conf, device=device)

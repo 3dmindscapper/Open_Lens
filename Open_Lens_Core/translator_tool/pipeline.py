@@ -33,6 +33,7 @@ from .language_utils import (
 from .inpainter import remove_text_blocks, remove_text
 from .renderer import render_translated_blocks, find_system_font
 from .layout_detector import detect_layout, filter_text_regions, crop_region
+from .text_classifier import classify_blocks
 
 log = logging.getLogger(__name__)
 
@@ -155,10 +156,27 @@ def process_page(
 
     log(f"    Found {len(all_blocks)} text block(s).")
 
+    # ---- Step 3b: Classify blocks (watermark / stamp / noise filter) ------
+    log("    Classifying text blocks…")
+    all_blocks = classify_blocks(all_blocks, page_image)
+    skip_count = sum(1 for b in all_blocks if b.get("_skip"))
+    if skip_count:
+        skip_details = {}
+        for b in all_blocks:
+            if b.get("_skip"):
+                cls = b.get("_classification", "unknown")
+                skip_details[cls] = skip_details.get(cls, 0) + 1
+        detail_str = ", ".join(f"{v} {k}" for k, v in skip_details.items())
+        log(f"    Filtered {skip_count} block(s): {detail_str}")
+    active_blocks = [b for b in all_blocks if not b.get("_skip")]
+    if not active_blocks:
+        log("    All blocks filtered — returning unchanged.")
+        return page_image.copy()
+
     # ---- Step 4: Translate -------------------------------------------------
     log(f"    Translating to '{target_lang}' ({config.translator_engine})…")
-    all_blocks = translate_blocks_batch(
-        all_blocks,
+    active_blocks = translate_blocks_batch(
+        active_blocks,
         target_lang=target_lang,
         source_lang=src_for_translation,
         engine=config.translator_engine,
@@ -169,8 +187,8 @@ def process_page(
     )
 
     # ---- Step 5: Separate data-only vs. translatable blocks ----------------
-    blocks_to_render = [b for b in all_blocks if not b.get("_data_only")]
-    preserved_count = len(all_blocks) - len(blocks_to_render)
+    blocks_to_render = [b for b in active_blocks if not b.get("_data_only")]
+    preserved_count = len(active_blocks) - len(blocks_to_render)
 
     if preserved_count:
         log(f"    Preserving {preserved_count} data-only block(s) unchanged.")

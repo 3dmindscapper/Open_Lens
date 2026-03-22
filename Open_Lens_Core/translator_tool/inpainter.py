@@ -31,8 +31,9 @@ def remove_text_blocks(
 
     Uses **word-level** bounding boxes when available (``block["word_boxes"]``)
     so that table borders, lines, and other non-text elements inside a block's
-    overall bounding box are preserved.  The mask is refined with ink-detection
-    and morphological dilation to cleanly catch anti-aliased text edges.
+    overall bounding box are preserved.  All OCR-confirmed word boxes are
+    masked unconditionally, then the mask is dilated to cleanly catch
+    anti-aliased text edges and descenders.
 
     Args:
         image:         Input PIL Image (RGB).
@@ -48,10 +49,10 @@ def remove_text_blocks(
 
     img_np = np.array(image, dtype=np.uint8)
     h_img, w_img = img_np.shape[:2]
-    gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
-    hsv = cv2.cvtColor(img_np, cv2.COLOR_RGB2HSV)
 
-    # Build mask from word-level boxes, refined with ink detection
+    # Build mask from word-level boxes.
+    # OCR confirmed text in every block that reaches this point, so we
+    # always mask the padded word box.
     mask = np.zeros((h_img, w_img), dtype=np.uint8)
     for block in blocks:
         pad = _dynamic_padding(block, padding)
@@ -62,41 +63,10 @@ def remove_text_blocks(
             y1 = max(0, wb["y"] - pad)
             x2 = min(w_img, wb.get("x2", wb["x"] + wb["w"]) + pad)
             y2 = min(h_img, wb.get("y2", wb["y"] + wb["h"]) + pad)
+            mask[y1:y2, x1:x2] = 255
 
-            # Within the padded word box, detect actual ink pixels:
-            # find the local background brightness and threshold below it.
-            roi_gray = gray[y1:y2, x1:x2]
-            if roi_gray.size == 0:
-                continue
-
-            # Adaptive threshold: pixels definitively darker than the local
-            # background are ink.  Use a wide margin to avoid catching
-            # watermarks, stamps, and other semi-transparent overlays.
-            bg_bright = np.percentile(roi_gray, 90)
-            ink_thresh = bg_bright - 40
-            ink_mask = (roi_gray < ink_thresh).astype(np.uint8) * 255
-
-            # Also detect colored (saturated) text: red, blue, etc.
-            # Use a high bar to avoid catching gray watermark tints.
-            roi_sat = hsv[y1:y2, x1:x2, 1]
-            bg_sat = np.percentile(roi_sat, 15)
-            sat_thresh = max(bg_sat + 60, 70)
-            color_ink = (roi_sat > sat_thresh).astype(np.uint8) * 255
-            ink_mask = np.maximum(ink_mask, color_ink)
-
-            if ink_mask.any():
-                # Tesseract confirmed text in this word box — always fill
-                # the entire box so no ghost fragments remain.  Partial
-                # pixel-level masking produced half-erased words when text
-                # sits over stamps, watermarks, or low-contrast areas.
-                mask[y1:y2, x1:x2] = 255
-            else:
-                # Zero ink detected at all — likely a false-positive OCR
-                # word box over blank background.  Skip to avoid damaging
-                # watermarks or decorative elements.
-                pass
-
-    # Morphological dilation to catch anti-aliased text edges
+    # Light dilation to catch anti-aliased text edges — small kernel,
+    # single iteration to avoid over-expansion that smudges backgrounds.
     if mask.any():
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
         mask = cv2.dilate(mask, kernel, iterations=1)
@@ -238,8 +208,9 @@ def _get_lama_model():
 def _dynamic_padding(block: Dict[str, Any], base_padding: int = 8) -> int:
     """Compute padding proportional to the text height in a block.
 
-    Larger text needs more padding to fully cover anti-aliased edges and
-    descenders that extend beyond the tight OCR bounding box.
+    Larger text needs more padding to cover anti-aliased edges and
+    descenders, but the padding is capped to prevent over-masking that
+    causes smudging on complex backgrounds.
     """
     word_boxes = block.get("word_boxes")
     heights = []
@@ -248,8 +219,9 @@ def _dynamic_padding(block: Dict[str, Any], base_padding: int = 8) -> int:
     if not heights:
         heights = [block.get("h", 0)]
     avg_h = sum(heights) / len(heights) if heights else 0
-    # Scale padding: min 8px, roughly 25% of average text height
-    return max(base_padding, int(avg_h * 0.25))
+    # Scale padding: 15% of average text height, capped to prevent over-masking.
+    # Smaller padding + light dilation is better than huge padding.
+    return max(base_padding, min(int(avg_h * 0.15), 14))
 
 
 def _build_mask(
@@ -257,12 +229,10 @@ def _build_mask(
     blocks: List[Dict[str, Any]],
     padding: int = 8,
 ) -> np.ndarray:
-    """Build a binary mask covering all text regions using word-level boxes
-    and ink detection, then dilate to catch anti-aliased edges."""
+    """Build a binary mask covering all text regions using word-level boxes,
+    then dilate to catch anti-aliased edges and descenders."""
     img_np = np.array(image, dtype=np.uint8)
     h_img, w_img = img_np.shape[:2]
-    gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
-    hsv = cv2.cvtColor(img_np, cv2.COLOR_RGB2HSV)
 
     mask = np.zeros((h_img, w_img), dtype=np.uint8)
     for block in blocks:
@@ -274,26 +244,9 @@ def _build_mask(
             y1 = max(0, wb["y"] - pad)
             x2 = min(w_img, wb.get("x2", wb["x"] + wb["w"]) + pad)
             y2 = min(h_img, wb.get("y2", wb["y"] + wb["h"]) + pad)
+            mask[y1:y2, x1:x2] = 255
 
-            roi_gray = gray[y1:y2, x1:x2]
-            if roi_gray.size == 0:
-                continue
-
-            bg_bright = np.percentile(roi_gray, 90)
-            ink_thresh = bg_bright - 40
-            ink_mask = (roi_gray < ink_thresh).astype(np.uint8) * 255
-
-            roi_sat = hsv[y1:y2, x1:x2, 1]
-            bg_sat = np.percentile(roi_sat, 15)
-            sat_thresh = max(bg_sat + 60, 70)
-            color_ink = (roi_sat > sat_thresh).astype(np.uint8) * 255
-            ink_mask = np.maximum(ink_mask, color_ink)
-
-            if ink_mask.any():
-                mask[y1:y2, x1:x2] = 255
-
-    # Morphological dilation to catch anti-aliased text edges and any
-    # remaining ink fragments just outside the padded bounding boxes.
+    # Light dilation — small kernel, single pass to avoid smudging.
     if mask.any():
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
         mask = cv2.dilate(mask, kernel, iterations=1)
