@@ -4,12 +4,16 @@ Language detection and translation utilities.
 Language detection: langdetect  (offline, statistical)
 Translation:        argostranslate (fully offline neural MT — models downloaded once,
                     then run locally with no internet connection required)
+                    Optional: Ollama (local LLM server) for domain-specific quality
 """
 
 from __future__ import annotations
 
+import logging
 import re
 from typing import List, Dict, Any, Optional
+
+log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Language code mappings
@@ -336,31 +340,51 @@ def _split_bullet_prefix(text: str):
     return "", text
 
 
-def _post_process_translation(text: str, source_lang: str, target_lang: str) -> str:
-    """Fix common translation artefacts.
+# ---------------------------------------------------------------------------
+# Block-level data classification
+# ---------------------------------------------------------------------------
+# Instead of trying to protect individual tokens within a phrase (which
+# fragments translatable text and causes partial-word inpainting), we
+# classify entire blocks as either "data-only" or "translatable".
+#
+# A data-only block contains no real words — just numbers, dates, codes,
+# punctuation, and symbols.  These are never sent to the translation
+# engine and their original pixels are preserved.
+# ---------------------------------------------------------------------------
 
-    Argos Translate sometimes leaves source-language words untranslated or
-    produces hallucinations on short fragments.  This function applies
-    targeted corrections for known patterns.
+# Match sequences of 2+ consecutive alphabetic characters (including accented)
+_WORD_RE = re.compile(r'[a-zA-Z\u00C0-\u024F]{2,}')
+
+
+def is_data_only_block(text: str) -> bool:
+    """Return True if *text* contains no meaningful translatable words.
+
+    Blocks that are purely numeric (dates, codes, amounts, postal codes)
+    should not be translated or inpainted — their original pixels are
+    already correct.
+
+    Conservative approach: a block is data-only ONLY if it contains no
+    word-like sequences of 2+ alphabetic characters.  Mixed blocks like
+    ``"Le 14/09/1964 à Metz (57)"`` contain words ("Le", "Metz") and
+    will be translated so no untranslated text remains visible.
+    """
+    if not text:
+        return True
+    words = _WORD_RE.findall(text)
+    return len(words) == 0
+
+
+def _post_process_translation(text: str, source_lang: str, target_lang: str) -> str:
+    """Clean up translation artefacts (whitespace, punctuation).
+
+    No hardcoded word replacements — the translation engine output is
+    trusted as-is so the tool stays flexible across all document types.
     """
     if not text:
         return text
 
-    # Case-insensitive whole-word replacements: source word → {target_lang: replacement}
-    _FIXUPS: Dict[str, Dict[str, str]] = {
-        r'\bdiplome\b':       {"en": "diploma", "es": "diploma", "de": "Diplom", "it": "diploma", "pt": "diploma"},
-        r'\bdiplôme\b':       {"en": "diploma", "es": "diploma", "de": "Diplom", "it": "diploma", "pt": "diploma"},
-        r'\bDIPLOME\b':       {"en": "DIPLOMA", "es": "DIPLOMA", "de": "DIPLOM", "it": "DIPLOMA", "pt": "DIPLOMA"},
-        r'\bDIPLÔME\b':      {"en": "DIPLOMA", "es": "DIPLOMA", "de": "DIPLOM", "it": "DIPLOMA", "pt": "DIPLOMA"},
-        r'\btitulaire\b':     {"en": "holder", "es": "titular", "de": "Inhaber", "it": "titolare", "pt": "titular"},
-        r'\bTITULAIRE\b':    {"en": "HOLDER", "es": "TITULAR", "de": "INHABER", "it": "TITOLARE", "pt": "TITULAR"},
-        r'\bhelic[oó]ptero\b': {"en": "holder", "es": "titular", "de": "Inhaber", "it": "titolare", "pt": "titular"},
-    }
-
-    tl = target_lang.lower().split("-")[0]
-    for pattern, replacements in _FIXUPS.items():
-        if tl in replacements:
-            text = re.sub(pattern, replacements[tl], text, flags=re.IGNORECASE)
+    # Collapse multiple spaces into one
+    text = re.sub(r' {2,}', ' ', text).strip()
 
     return text
 
@@ -398,8 +422,22 @@ def translate_blocks(
             block["translated_text"] = block["text"]
         return blocks
 
-    log(f"    [translate] Translating {len(blocks)} block(s) …")
+    # Classify blocks: data-only blocks are preserved as-is.
+    data_count = 0
+    translatable_blocks = []
     for block in blocks:
+        if is_data_only_block(block["text"]):
+            block["translated_text"] = block["text"]
+            block["_data_only"] = True
+            data_count += 1
+        else:
+            translatable_blocks.append(block)
+
+    if data_count:
+        log(f"    [translate] {data_count} data-only block(s) preserved as-is.")
+
+    log(f"    [translate] Translating {len(translatable_blocks)} block(s) …")
+    for block in translatable_blocks:
         try:
             prefix, body = _split_bullet_prefix(block["text"])
             if body.strip():
@@ -432,3 +470,257 @@ def translate_single(text: str, target_lang: str, source_lang: str = "auto") -> 
     except Exception as exc:
         print(f"  [translate] Single translation failed: {exc}")
         return text
+
+
+# ---------------------------------------------------------------------------
+# Ollama-based translation (optional local LLM)
+# ---------------------------------------------------------------------------
+
+def _translate_ollama(
+    text: str,
+    source_lang: str,
+    target_lang: str,
+    ollama_url: str = "http://localhost:11434",
+    ollama_model: str = "qwen2.5:7b",
+    context: str = "",
+    timeout: int = 60,
+) -> Optional[str]:
+    """Translate *text* using a local Ollama LLM server.
+
+    Returns the translated text or ``None`` if the server is unreachable.
+    """
+    import urllib.request
+    import json
+
+    # Build a structured prompt that constrains the model to return only
+    # the translation, with optional page-level context for coherence.
+    ctx_part = ""
+    if context:
+        ctx_part = (
+            f"\nFor context, here is the full page text (same language as the source):\n"
+            f"---\n{context[:2000]}\n---\n"
+        )
+
+    prompt = (
+        f"Translate the following text from {source_lang} to {target_lang}. "
+        f"Return ONLY the translated text, nothing else. "
+        f"Preserve formatting, numbers, dates, and proper nouns as-is."
+        f"{ctx_part}\n"
+        f"Text to translate:\n{text}"
+    )
+
+    payload = json.dumps({
+        "model": ollama_model,
+        "prompt": prompt,
+        "stream": False,
+        "options": {"temperature": 0.1},
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        f"{ollama_url}/api/generate",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+            return result.get("response", "").strip() or None
+    except Exception as exc:
+        log.warning("Ollama translation failed: %s", exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Glossary support
+# ---------------------------------------------------------------------------
+
+_GLOSSARY_CACHE: Dict[str, Dict[str, str]] = {}
+
+
+def _load_glossary(glossary_path: str) -> Dict[str, str]:
+    """Load a TSV glossary file (source_term<TAB>target_term) into a dict."""
+    if glossary_path in _GLOSSARY_CACHE:
+        return _GLOSSARY_CACHE[glossary_path]
+
+    glossary: Dict[str, str] = {}
+    try:
+        with open(glossary_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split("\t", 1)
+                if len(parts) == 2:
+                    glossary[parts[0].strip()] = parts[1].strip()
+    except Exception as exc:
+        log.warning("Failed to load glossary %s: %s", glossary_path, exc)
+
+    _GLOSSARY_CACHE[glossary_path] = glossary
+    return glossary
+
+
+def _apply_glossary(text: str, glossary: Dict[str, str]) -> str:
+    """Replace glossary source terms with target terms in translated text."""
+    for source_term, target_term in glossary.items():
+        # Case-insensitive whole-word replacement
+        pattern = re.compile(re.escape(source_term), re.IGNORECASE)
+        text = pattern.sub(target_term, text)
+    return text
+
+
+# ---------------------------------------------------------------------------
+# Context-aware batch translation
+# ---------------------------------------------------------------------------
+
+def translate_blocks_batch(
+    blocks: List[Dict[str, Any]],
+    target_lang: str,
+    source_lang: str = "auto",
+    engine: str = "argos",
+    ollama_url: str = "http://localhost:11434",
+    ollama_model: str = "qwen2.5:7b",
+    glossary_path: Optional[str] = None,
+    log_fn=print,
+    **_kwargs,
+) -> List[Dict[str, Any]]:
+    """Translate blocks with optional context awareness and engine selection.
+
+    This is the new unified entry point that replaces ``translate_blocks``
+    when called from the upgraded pipeline.
+
+    Args:
+        blocks:          Text blocks from OCR.
+        target_lang:     Target language code.
+        source_lang:     Source language code or ``"auto"``.
+        engine:          ``"argos"`` or ``"ollama"``.
+        ollama_url:      Ollama server URL.
+        ollama_model:    Ollama model name.
+        glossary_path:   Path to a TSV glossary file (optional).
+        log_fn:          Logger callable.
+
+    Returns:
+        Blocks with ``translated_text`` populated.
+    """
+    if not blocks:
+        return blocks
+
+    from_code = _normalise_lang(source_lang) if source_lang not in ("auto", "") else "en"
+    to_code = _normalise_lang(target_lang)
+
+    if from_code == to_code:
+        for block in blocks:
+            block["translated_text"] = block["text"]
+        return blocks
+
+    # Classify data-only blocks
+    data_count = 0
+    translatable_blocks = []
+    for block in blocks:
+        if is_data_only_block(block["text"]):
+            block["translated_text"] = block["text"]
+            block["_data_only"] = True
+            data_count += 1
+        else:
+            translatable_blocks.append(block)
+
+    if data_count:
+        log_fn(f"    [translate] {data_count} data-only block(s) preserved as-is.")
+
+    if not translatable_blocks:
+        return blocks
+
+    # Build page-level context for coherence
+    page_context = " ".join(b["text"] for b in translatable_blocks)
+
+    # Load glossary if provided
+    glossary = _load_glossary(glossary_path) if glossary_path else {}
+
+    # --- Ollama engine ---
+    if engine == "ollama":
+        log_fn(f"    [translate] Using Ollama ({ollama_model}) for {len(translatable_blocks)} block(s)")
+        for block in translatable_blocks:
+            prefix, body = _split_bullet_prefix(block["text"])
+            if body.strip():
+                result = _translate_ollama(
+                    body, source_lang, target_lang,
+                    ollama_url=ollama_url, ollama_model=ollama_model,
+                    context=page_context,
+                )
+                if result:
+                    result = _post_process_translation(result, from_code, to_code)
+                    if glossary:
+                        result = _apply_glossary(result, glossary)
+                    block["translated_text"] = prefix + result
+                else:
+                    # Ollama failed — fall back to Argos for this block
+                    log_fn("    [translate] Ollama failed, falling back to Argos")
+                    _translate_block_argos(block, from_code, to_code, glossary, log_fn)
+            else:
+                block["translated_text"] = block["text"]
+        return blocks
+
+    # --- Argos engine (default) ---
+    log_fn(f"    [translate] Using Argos for {len(translatable_blocks)} block(s)")
+    try:
+        translate_fn = _get_translation_fn(from_code, to_code, log=log_fn)
+    except Exception as exc:
+        log_fn(f"    [translate] Cannot load Argos: {exc}")
+        translate_fn = None
+
+    if translate_fn is None:
+        log_fn(f"    [translate] No model for {from_code}→{to_code}. Text kept as-is.")
+        for block in translatable_blocks:
+            block["translated_text"] = block["text"]
+        return blocks
+
+    for block in translatable_blocks:
+        try:
+            prefix, body = _split_bullet_prefix(block["text"])
+            if body.strip():
+                result = translate_fn(body)
+                if result:
+                    result = _post_process_translation(result, from_code, to_code)
+                    if glossary:
+                        result = _apply_glossary(result, glossary)
+                    block["translated_text"] = prefix + result
+                else:
+                    block["translated_text"] = block["text"]
+            else:
+                block["translated_text"] = block["text"]
+        except Exception as exc:
+            log_fn(f"    [translate] Block failed: {exc}")
+            block["translated_text"] = block["text"]
+
+    return blocks
+
+
+def _translate_block_argos(
+    block: Dict[str, Any],
+    from_code: str,
+    to_code: str,
+    glossary: Dict[str, str],
+    log_fn=print,
+):
+    """Translate a single block using Argos (helper for Ollama fallback)."""
+    try:
+        translate_fn = _get_translation_fn(from_code, to_code, log=log_fn)
+        if translate_fn is None:
+            block["translated_text"] = block["text"]
+            return
+        prefix, body = _split_bullet_prefix(block["text"])
+        if body.strip():
+            result = translate_fn(body)
+            if result:
+                result = _post_process_translation(result, from_code, to_code)
+                if glossary:
+                    result = _apply_glossary(result, glossary)
+                block["translated_text"] = prefix + result
+            else:
+                block["translated_text"] = block["text"]
+        else:
+            block["translated_text"] = block["text"]
+    except Exception as exc:
+        log_fn(f"    [translate] Argos fallback failed: {exc}")
+        block["translated_text"] = block["text"]

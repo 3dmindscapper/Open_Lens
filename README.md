@@ -2,15 +2,19 @@
 
 Open Lens is an offline document translation tool that translates text directly on documents while preserving their original layout and readability. It processes **PNG**, **JPG**, and **PDF** files (including multi-page PDFs) by detecting the source language, translating the text, inpainting the document to remove the original text, and overlaying formatted translated text that matches the original document's appearance.
 
+Every component is **pluggable** — the pipeline auto-detects the best available backends at runtime and falls back gracefully when optional dependencies are not installed.
+
 ## How It Works
 
-The translation pipeline runs five steps on every page:
+The translation pipeline runs seven steps on every page:
 
-1. **OCR** — Tesseract extracts text blocks with bounding boxes at paragraph level.
+1. **Layout Detection** *(optional)* — Identifies semantic document regions (text, titles, tables, figures) using Layout Parser (Detectron2 / PubLayNet) or PaddleOCR PP-Structure. Skipped automatically when neither library is installed.
 2. **Language Detection** — `langdetect` identifies the source language automatically.
-3. **Translation** — Argos Translate performs fully offline neural machine translation. Models (~100 MB each) are downloaded once and cached locally.
-4. **Inpainting** — OpenCV erases the original text regions and reconstructs the background using the TELEA algorithm, smoothing uniform backgrounds for a clean result.
-5. **Rendering** — Translated text is drawn back into each bounding box with auto-fitted font size, word wrapping, sampled ink colour from the original, and RTL support for Arabic/Hebrew.
+3. **OCR** — PaddleOCR (preferred) or Tesseract extracts text blocks with bounding boxes, optionally scoped to each layout region for tighter results.
+4. **Translation** — Argos Translate (default, fully offline) or a local Ollama LLM server performs translation. An optional TSV glossary can enforce domain-specific terminology.
+5. **Inpainting** — LaMa deep-learning inpainter (preferred) or OpenCV TELEA erases the original text and reconstructs the background — even over stamps, watermarks, and complex textures.
+6. **Font Analysis** — K-means colour extraction, distance-transform stroke-width detection, and binary-search font-size calibration ensure the rendered text closely matches the original style.
+7. **Rendering** — Translated text is drawn back into each bounding box with calibrated font size, detected alignment (left / centre / right), measured line spacing, sampled ink colour, and RTL support for Arabic/Hebrew.
 
 ## Supported Formats
 
@@ -32,15 +36,25 @@ Multi-page PDFs are converted page-by-page at 200 DPI, processed individually, a
 - **Poppler** — Bundled for Windows under `poppler-25.12.0/`. On other platforms install via `brew install poppler` (macOS) or `sudo apt install poppler-utils` (Linux / Chrome OS). Required for PDF support.
 - **Tkinter** (Linux / Chrome OS only, if using the GUI) — `sudo apt install python3-tk`
 
-Python dependencies (installed via pip):
+### Core dependencies
 
-```
+```bash
 pip install -r Open_Lens_Core/requirements_translator.txt
 ```
 
-Key packages: `Pillow`, `numpy`, `opencv-python`, `pytesseract`, `langdetect`, `argostranslate`, `pdf2image`.
+Key packages: `Pillow`, `numpy`, `opencv-python`, `pytesseract`, `langdetect`, `argostranslate`, `pdf2image`, `flask`.
 
-Optional for RTL languages: `arabic-reshaper`, `python-bidi`.
+### Optional enhanced backends
+
+Install any combination — the pipeline auto-detects what is available and falls back to the baseline.
+
+| Backend | Install | What it improves |
+|---------|---------|------------------|
+| **PaddleOCR** | `pip install paddlepaddle paddleocr` | Better OCR on complex backgrounds |
+| **Layout Parser** | `pip install layoutparser` + [Detectron2](https://detectron2.readthedocs.io/en/latest/tutorials/install.html) | Semantic layout detection (text / title / table / figure) |
+| **LaMa inpainting** | `pip install simple-lama-inpainting torch` | Deep-learning text removal (stamps, watermarks) |
+| **Ollama** | [ollama.com](https://ollama.com/) + `ollama pull qwen2.5:7b` | Local LLM translation with domain context |
+| **RTL support** | `pip install arabic-reshaper python-bidi` | Arabic, Hebrew, Persian, Urdu rendering |
 
 ## Quick Start
 
@@ -81,12 +95,20 @@ python translate.py invoice.png -t es --tesseract "C:\Program Files\Tesseract-OC
 
 | Flag | Description |
 |------|-------------|
-| `-t`, `--target` | Target language code (e.g. `en`, `fr`, `de`, `es`) — **required** |
+| `-t`, `--target` | Target language code (e.g. `en`, `fr`, `de`, `es`) |
 | `-s`, `--source` | Source language code (default: `auto` — auto-detect) |
 | `-o`, `--output` | Output file path (auto-generated if omitted) |
 | `--tesseract` | Path to Tesseract binary |
 | `--font` | Path to a custom `.ttf` font file |
 | `-q`, `--quiet` | Suppress progress output |
+| `--layout-engine` | `auto` · `layoutparser` · `paddleocr` · `none` |
+| `--ocr-engine` | `auto` · `paddleocr` · `tesseract` |
+| `--inpaint-engine` | `auto` · `lama` · `telea` |
+| `--translator` | `auto` · `argos` · `ollama` |
+| `--device` | `auto` · `cuda` · `cpu` |
+| `--ollama-url` | Ollama server URL (default: `http://localhost:11434`) |
+| `--ollama-model` | Ollama model name (default: `qwen2.5:7b`) |
+| `--glossary` | Path to a TSV glossary file (`source_term<TAB>target_term`) |
 
 ## Project Structure
 
@@ -100,16 +122,19 @@ Open_Lens/
 ├── README.md                      # This file
 ├── Open_Lens_Core/
 │   ├── translate.py               # CLI entry point
-│   ├── translator_ui.py           # Tkinter GUI
+│   ├── translator_ui.py           # Tkinter GUI (with engine selection)
 │   ├── web_app.py                 # Flask web server (LAN-accessible)
 │   ├── requirements_translator.txt
 │   └── translator_tool/           # Core library
 │       ├── __init__.py
 │       ├── main.py                # Argument parser & CLI logic
+│       ├── config.py              # TranslationConfig — auto-detection & fallback
 │       ├── pipeline.py            # Orchestrates the full pipeline
-│       ├── ocr_extractor.py       # Tesseract OCR wrapper
-│       ├── language_utils.py      # Language detection & Argos translation
-│       ├── inpainter.py           # OpenCV text removal
+│       ├── layout_detector.py     # Layout Parser / PaddleOCR layout detection
+│       ├── ocr_extractor.py       # PaddleOCR + Tesseract OCR
+│       ├── language_utils.py      # Language detection, Argos & Ollama translation
+│       ├── inpainter.py           # LaMa + OpenCV TELEA text removal
+│       ├── font_analyzer.py       # Colour, weight, alignment & size analysis
 │       ├── renderer.py            # Translated text rendering
 │       └── file_handler.py        # File I/O (PDF, images)
 └── poppler-25.12.0/               # Bundled Poppler binaries for PDF support

@@ -1,25 +1,40 @@
 """
 Main translation pipeline.
 
-Orchestrates: load → OCR → language detection → translate → inpaint → render → save.
+Orchestrates:
+    layout detect → OCR → language detection → translate → inpaint → render → save.
+
+All backend choices (layout engine, OCR engine, inpainter, translator) are
+controlled by :class:`config.TranslationConfig` with automatic fallback chains.
 """
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import List, Optional, Callable, Any
 
 from PIL import Image
 
+from .config import TranslationConfig
 from .file_handler import load_document, save_output, guess_output_path
-from .ocr_extractor import extract_text_blocks, extract_full_text, configure_tesseract_path
+from .ocr_extractor import (
+    extract_text_blocks,
+    extract_text_blocks_unified,
+    extract_full_text,
+    configure_tesseract_path,
+)
 from .language_utils import (
     detect_language,
     langdetect_to_tesseract,
     translate_blocks,
+    translate_blocks_batch,
 )
-from .inpainter import remove_text_blocks
+from .inpainter import remove_text_blocks, remove_text
 from .renderer import render_translated_blocks, find_system_font
+from .layout_detector import detect_layout, filter_text_regions, crop_region
+
+log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -33,6 +48,7 @@ def process_page(
     tesseract_cmd: Optional[str] = None,
     font_path: Optional[str] = None,
     log: Callable[[str], Any] = print,
+    config: Optional[TranslationConfig] = None,
 ) -> Image.Image:
     """Run the full translation pipeline on a single page image.
 
@@ -43,61 +59,137 @@ def process_page(
         tesseract_cmd: Path to the Tesseract binary (optional override).
         font_path:     Path to a .ttf font file (optional override).
         log:           Callable used for progress messages.
+        config:        Pipeline configuration. Auto-detected if ``None``.
 
     Returns:
         Processed PIL Image with translated text in place.
     """
-    if tesseract_cmd:
-        configure_tesseract_path(tesseract_cmd)
+    # Resolve config
+    if config is None:
+        config = TranslationConfig(
+            target_lang=target_lang,
+            source_lang=source_lang,
+            tesseract_cmd=tesseract_cmd,
+            font_path=font_path,
+        )
+    config.resolve()
 
-    # ---- Step 1: First-pass OCR (English) to gather text for language detection
+    if config.tesseract_cmd:
+        configure_tesseract_path(config.tesseract_cmd)
+
+    log(f"    Config: {config.summary()}")
+
+    # ---- Step 1: Layout detection (new) -----------------------------------
+    regions = []
+    if config.layout_engine != "none":
+        log(f"    Detecting layout ({config.layout_engine})…")
+        try:
+            regions = detect_layout(
+                page_image,
+                engine=config.layout_engine,
+                device=config.device,
+                model_label=config.layout_model,
+                min_confidence=config.layout_confidence,
+            )
+            text_regions = filter_text_regions(regions)
+            log(f"    Layout: {len(regions)} region(s), {len(text_regions)} text region(s).")
+        except Exception as exc:
+            log(f"    Layout detection failed ({exc}), continuing without layout.")
+            regions = []
+
+    # ---- Step 2: Language detection ----------------------------------------
     if source_lang == "auto":
         log("    Detecting language…")
-        sample_text = extract_full_text(page_image, ocr_lang="eng")
+        sample_text = extract_full_text(page_image, ocr_lang="eng", engine=config.ocr_engine)
         detected_lang = detect_language(sample_text)
         ocr_lang = langdetect_to_tesseract(detected_lang)
         src_for_translation = detected_lang
-        log(f"    Detected language: {detected_lang}  →  Tesseract pack: {ocr_lang}")
+        log(f"    Detected language: {detected_lang}  →  OCR pack: {ocr_lang}")
     else:
         ocr_lang = langdetect_to_tesseract(source_lang)
         src_for_translation = source_lang
-        log(f"    Using source language: {source_lang}  →  Tesseract pack: {ocr_lang}")
+        log(f"    Using source language: {source_lang}  →  OCR pack: {ocr_lang}")
 
-    # ---- Step 2: Proper OCR pass with the correct language pack
-    log(f"    Running OCR (lang={ocr_lang})…")
-    blocks = extract_text_blocks(page_image, ocr_lang=ocr_lang)
+    # ---- Step 3: OCR -------------------------------------------------------
+    text_regions = filter_text_regions(regions) if regions else []
+    all_blocks = []
 
-    # If the language-specific pack fails or finds nothing, fall back to English
-    if not blocks and ocr_lang != "eng":
+    if text_regions:
+        # Region-aware OCR: process each layout region independently
+        log(f"    Running OCR per-region ({config.ocr_engine}, lang={ocr_lang})…")
+        for region in text_regions:
+            cropped = crop_region(page_image, region)
+            region_blocks = extract_text_blocks_unified(
+                cropped,
+                ocr_lang=ocr_lang,
+                engine=config.ocr_engine,
+                device=config.device,
+                region_offset=(region.x, region.y),
+            )
+            # Attach region type metadata to each block
+            for b in region_blocks:
+                b["_region_type"] = region.region_type
+            all_blocks.extend(region_blocks)
+    else:
+        # No layout regions — full page OCR (original behaviour)
+        log(f"    Running OCR ({config.ocr_engine}, lang={ocr_lang})…")
+        all_blocks = extract_text_blocks_unified(
+            page_image,
+            ocr_lang=ocr_lang,
+            engine=config.ocr_engine,
+            device=config.device,
+        )
+
+    # Fallback: if primary engine produces nothing, try Tesseract
+    if not all_blocks and config.ocr_engine != "tesseract":
+        log("    Primary OCR returned no blocks, retrying with Tesseract…")
+        all_blocks = extract_text_blocks(page_image, ocr_lang=ocr_lang)
+
+    if not all_blocks and ocr_lang != "eng":
         log("    Language pack returned no blocks, retrying with 'eng'…")
-        blocks = extract_text_blocks(page_image, ocr_lang="eng")
+        all_blocks = extract_text_blocks(page_image, ocr_lang="eng")
 
-    if not blocks:
+    if not all_blocks:
         log("    No text found on this page – returning unchanged.")
         return page_image.copy()
 
-    log(f"    Found {len(blocks)} text block(s).")
+    log(f"    Found {len(all_blocks)} text block(s).")
 
-    # ---- Step 3: Translate
-    log(f"    Translating to '{target_lang}'…")
-    blocks = translate_blocks(
-        blocks,
+    # ---- Step 4: Translate -------------------------------------------------
+    log(f"    Translating to '{target_lang}' ({config.translator_engine})…")
+    all_blocks = translate_blocks_batch(
+        all_blocks,
         target_lang=target_lang,
         source_lang=src_for_translation,
-        log=log,
+        engine=config.translator_engine,
+        ollama_url=config.ollama_url or "http://localhost:11434",
+        ollama_model=config.ollama_model or "qwen2.5:7b",
+        glossary_path=config.glossary_path,
+        log_fn=log,
     )
 
-    # ---- Step 4: Inpaint (remove original text)
-    log("    Removing original text (inpainting)…")
-    inpainted = remove_text_blocks(page_image, blocks)
+    # ---- Step 5: Separate data-only vs. translatable blocks ----------------
+    blocks_to_render = [b for b in all_blocks if not b.get("_data_only")]
+    preserved_count = len(all_blocks) - len(blocks_to_render)
 
-    # ---- Step 5: Render translated text
+    if preserved_count:
+        log(f"    Preserving {preserved_count} data-only block(s) unchanged.")
+
+    # ---- Step 6: Inpaint ---------------------------------------------------
+    log(f"    Removing original text ({config.inpaint_engine})…")
+    inpainted = remove_text(
+        page_image,
+        blocks_to_render,
+        engine=config.inpaint_engine,
+    )
+
+    # ---- Step 7: Render translated text ------------------------------------
     log("    Rendering translated text…")
     final = render_translated_blocks(
         image=inpainted,
-        blocks=blocks,
+        blocks=blocks_to_render,
         original_image=page_image,
-        font_path=font_path,
+        font_path=config.font_path or font_path,
         target_lang=target_lang,
     )
 
@@ -117,6 +209,7 @@ def process_document(
     font_path: Optional[str] = None,
     verbose: bool = True,
     log_callback: Optional[Callable[[str], Any]] = None,
+    config: Optional[TranslationConfig] = None,
 ) -> str:
     """Translate all text in a document file and save the result.
 
@@ -131,46 +224,60 @@ def process_document(
         font_path:     Override path to a TrueType font file.
         verbose:       Print progress messages.
         log_callback:  Optional callable that receives each log message.
-                       When provided, overrides the built-in print logging.
+        config:        Pipeline configuration. Built from other args if ``None``.
 
     Returns:
         Path to the saved output file (or directory for multi-page images).
     """
-    def log(msg: str):
+    def log_msg(msg: str):
         if log_callback is not None:
             log_callback(msg)
         elif verbose:
             print(msg)
 
+    # Build config if not provided
+    if config is None:
+        config = TranslationConfig(
+            target_lang=target_lang,
+            source_lang=source_lang,
+            tesseract_cmd=tesseract_cmd,
+            font_path=font_path,
+        )
+    config.resolve()
+
     input_path = str(input_path)
     if output_path is None:
         output_path = guess_output_path(input_path, target_lang)
 
-    if font_path is None:
-        font_path = find_system_font()
+    if font_path is None and config.font_path is None:
+        config.font_path = find_system_font()
+    elif font_path:
+        config.font_path = font_path
 
-    log(f"Loading document: {input_path}")
+    log_msg(f"Loading document: {input_path}")
+    log_msg(f"  Pipeline: {config.summary()}")
     pages: List[Image.Image] = load_document(input_path)
-    log(f"  Loaded {len(pages)} page(s).")
+    log_msg(f"  Loaded {len(pages)} page(s).")
 
     processed: List[Image.Image] = []
 
     for idx, page in enumerate(pages):
-        log(f"\n  ── Page {idx + 1} / {len(pages)} ─────────────────")
+        log_msg(f"\n  ── Page {idx + 1} / {len(pages)} ─────────────────")
         result = process_page(
             page_image=page,
             target_lang=target_lang,
             source_lang=source_lang,
             tesseract_cmd=tesseract_cmd,
-            font_path=font_path,
-            log=lambda msg, _i=idx: log(msg),
+            font_path=config.font_path,
+            log=lambda msg, _i=idx: log_msg(msg),
+            config=config,
         )
         processed.append(result)
 
-    log(f"\nSaving output → {output_path}")
+    log_msg(f"\nSaving output → {output_path}")
     written = save_output(processed, output_path)
-    log("Done!  Written files:")
+    log_msg("Done!  Written files:")
     for f in written:
-        log(f"  {f}")
+        log_msg(f"  {f}")
 
     return output_path

@@ -1,10 +1,25 @@
-# Core image/document handling (already in layoutparser requirements)
+# Core image/document handling
 Pillow>=9.0.0
 numpy>=1.21.0
 opencv-python>=4.5.0
 
-# OCR (requires Tesseract binary – see README)
+# OCR — Tesseract (requires Tesseract binary – see README)
 pytesseract>=0.3.10
+
+# OCR — PaddleOCR (recommended: better detection on complex backgrounds)
+# Uncomment or install separately.  Falls back to Tesseract if unavailable.
+# paddlepaddle>=2.5.0      # CPU version; use paddlepaddle-gpu for CUDA
+# paddleocr>=2.7.0
+
+# Layout detection — Layout Parser (requires Detectron2)
+# Uncomment or install separately.  Falls back to PaddleOCR or none.
+# layoutparser>=0.3.4
+# detectron2               # follow https://detectron2.readthedocs.io/en/latest/tutorials/install.html
+
+# Inpainting — LaMa (deep learning, recommended for complex backgrounds)
+# Uncomment or install separately.  Falls back to OpenCV TELEA.
+# simple-lama-inpainting>=0.1.0
+# torch>=2.0.0             # required by LaMa
 
 # Language detection (fully offline, statistical)
 langdetect>=1.0.9

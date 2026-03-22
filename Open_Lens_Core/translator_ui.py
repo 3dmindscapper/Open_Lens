@@ -298,6 +298,52 @@ class TranslatorApp(tk.Tk):
             padx=10,
         ).grid(row=2, column=2, padx=(8, 0), pady=4)
 
+        # ---- Engine selection ----
+        engine_label = lambda row, text: tk.Label(
+            self._adv_frame, text=text, bg=BG, fg=SUBTEXT,
+            font=("Segoe UI", 9), anchor="w",
+        ).grid(row=row, column=0, sticky="w", padx=(0, 12), pady=4)
+
+        self._layout_engine_var = tk.StringVar(value="auto")
+        engine_label(3, "Layout engine")
+        ttk.Combobox(
+            self._adv_frame, textvariable=self._layout_engine_var,
+            values=["auto", "layoutparser", "paddleocr", "none"],
+            state="readonly", font=("Segoe UI", 9), width=18,
+        ).grid(row=3, column=1, sticky="w", pady=4)
+
+        self._ocr_engine_var = tk.StringVar(value="auto")
+        engine_label(4, "OCR engine")
+        ttk.Combobox(
+            self._adv_frame, textvariable=self._ocr_engine_var,
+            values=["auto", "paddleocr", "tesseract"],
+            state="readonly", font=("Segoe UI", 9), width=18,
+        ).grid(row=4, column=1, sticky="w", pady=4)
+
+        self._inpaint_engine_var = tk.StringVar(value="auto")
+        engine_label(5, "Inpainting engine")
+        ttk.Combobox(
+            self._adv_frame, textvariable=self._inpaint_engine_var,
+            values=["auto", "lama", "telea"],
+            state="readonly", font=("Segoe UI", 9), width=18,
+        ).grid(row=5, column=1, sticky="w", pady=4)
+
+        self._translator_engine_var = tk.StringVar(value="auto")
+        engine_label(6, "Translator")
+        ttk.Combobox(
+            self._adv_frame, textvariable=self._translator_engine_var,
+            values=["auto", "argos", "ollama"],
+            state="readonly", font=("Segoe UI", 9), width=18,
+        ).grid(row=6, column=1, sticky="w", pady=4)
+
+        self._device_var = tk.StringVar(value="auto")
+        engine_label(7, "Device")
+        ttk.Combobox(
+            self._adv_frame, textvariable=self._device_var,
+            values=["auto", "cuda", "cpu"],
+            state="readonly", font=("Segoe UI", 9), width=18,
+        ).grid(row=7, column=1, sticky="w", pady=4)
+
         # ---- Translate button
         self._btn = tk.Button(
             form, text="Translate Document",
@@ -441,6 +487,20 @@ class TranslatorApp(tk.Tk):
         if poppler and Path(poppler).exists():
             os.environ["PATH"] = poppler + os.pathsep + os.environ.get("PATH", "")
 
+        # Build config from advanced settings
+        from translator_tool.config import TranslationConfig
+        config = TranslationConfig(
+            target_lang=tgt_code,
+            source_lang=src_code,
+            tesseract_cmd=tess_cmd,
+            font_path=font_path,
+            layout_engine=self._layout_engine_var.get() or "auto",
+            ocr_engine=self._ocr_engine_var.get() or "auto",
+            inpaint_engine=self._inpaint_engine_var.get() or "auto",
+            translator_engine=self._translator_engine_var.get() or "auto",
+            device=self._device_var.get() or "auto",
+        )
+
         self._log_clear()
         self._log_write(f"Input:   {input_path}\n", "info")
         self._log_write(f"Output:  {output_path}\n", "info")
@@ -451,22 +511,33 @@ class TranslatorApp(tk.Tk):
 
         threading.Thread(
             target=self._run_pipeline,
-            args=(input_path, output_path, tgt_code, src_code, tess_cmd, font_path),
+            args=(input_path, output_path, config),
             daemon=True,
         ).start()
 
-    def _run_pipeline(self, input_path, output_path, tgt, src, tess_cmd, font_path):
+    def _run_pipeline(self, input_path, output_path, config):
         try:
             from translator_tool.pipeline import process_document
+
+            def _log_fn(msg):
+                # colour hints
+                if "error" in msg.lower() or "✗" in msg:
+                    self._enqueue_log(msg + "\n", "err")
+                elif "done" in msg.lower() or "✓" in msg or "saved" in msg.lower():
+                    self._enqueue_log(msg + "\n", "ok")
+                elif "warning" in msg.lower():
+                    self._enqueue_log(msg + "\n", "warn")
+                else:
+                    self._enqueue_log(msg + "\n")
+
             process_document(
                 input_path=input_path,
-                target_lang=tgt,
+                target_lang=config.target_lang,
                 output_path=output_path,
-                source_lang=src,
-                tesseract_cmd=tess_cmd,
-                font_path=font_path,
+                source_lang=config.source_lang,
                 verbose=True,
-                _log_fn=self._enqueue_log,
+                log_callback=_log_fn,
+                config=config,
             )
             self._enqueue_log(f"\n✓ Done!  Saved to:\n  {output_path}\n", "ok")
         except Exception as exc:
@@ -509,77 +580,9 @@ class TranslatorApp(tk.Tk):
 
 
 # ---------------------------------------------------------------------------
-# Patch pipeline to accept a custom log function
-# ---------------------------------------------------------------------------
-
-def _patch_pipeline():
-    """Monkey-patch process_document so it accepts an optional _log_fn kwarg."""
-    try:
-        import translator_tool.pipeline as _pipeline
-
-        _orig = _pipeline.process_document
-
-        def _patched(
-            input_path, target_lang, output_path=None, source_lang="auto",
-            tesseract_cmd=None, font_path=None, verbose=True, _log_fn=None,
-        ):
-            import sys as _sys
-            from pathlib import Path as _Path
-            from translator_tool.file_handler import load_document, save_output, guess_output_path
-            from translator_tool.pipeline import process_page
-
-            if output_path is None:
-                output_path = guess_output_path(str(input_path), target_lang)
-
-            from translator_tool.renderer import find_system_font
-            if font_path is None:
-                font_path = find_system_font()
-
-            def log(msg):
-                if _log_fn:
-                    # colour hints
-                    if "error" in msg.lower() or "✗" in msg:
-                        _log_fn(msg + "\n", "err")
-                    elif "done" in msg.lower() or "✓" in msg or "saved" in msg.lower():
-                        _log_fn(msg + "\n", "ok")
-                    elif "warning" in msg.lower():
-                        _log_fn(msg + "\n", "warn")
-                    else:
-                        _log_fn(msg + "\n")
-                elif verbose:
-                    print(msg)
-
-            log(f"Loading document: {input_path}")
-            pages = load_document(str(input_path))
-            log(f"  Loaded {len(pages)} page(s).")
-
-            processed = []
-            for idx, page in enumerate(pages):
-                log(f"\n── Page {idx + 1} / {len(pages)} ──────────────")
-                result = process_page(
-                    page_image=page,
-                    target_lang=target_lang,
-                    source_lang=source_lang,
-                    tesseract_cmd=tesseract_cmd,
-                    font_path=font_path,
-                    log=log,
-                )
-                processed.append(result)
-
-            log(f"\nSaving → {output_path}")
-            save_output(processed, output_path)
-            return output_path
-
-        _pipeline.process_document = _patched
-    except Exception:
-        pass  # if import fails, original pipeline is used
-
-
-# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    _patch_pipeline()
     app = TranslatorApp()
     app.mainloop()

@@ -1,21 +1,29 @@
 """
 OCR extraction module.
 
-Uses Tesseract (via pytesseract) to extract text blocks with their bounding boxes.
-Works at paragraph level so each block is a coherent unit for translation.
+Supports two engines:
+  - **PaddleOCR** (default when available): superior detection on complex
+    backgrounds, tighter bounding boxes, 80+ languages.
+  - **Tesseract** (fallback): via pytesseract, requires Tesseract binary.
+
+The public API (``extract_text_blocks``, ``extract_full_text``) auto-selects
+the best available engine unless the caller specifies one explicitly.
 """
 
 from __future__ import annotations
 
 import io
 import csv
+import logging
 import sys
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 from PIL import Image
+
+log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -216,7 +224,7 @@ def _split_wide_blocks(blocks: List[TextBlock], img_width: int) -> List[TextBloc
     result = []
     for block in blocks:
         word_boxes = block.get("word_boxes", [])
-        if len(word_boxes) < 3:
+        if len(word_boxes) < 2:
             result.append(block)
             continue
 
@@ -256,7 +264,7 @@ def _split_wide_blocks(blocks: List[TextBlock], img_width: int) -> List[TextBloc
             if not positive_gaps:
                 continue
             median_gap = sorted(positive_gaps)[len(positive_gaps) // 2]
-            threshold = max(40, int(median_gap * 3.5))
+            threshold = max(30, int(median_gap * 2.0))
 
             for i in range(1, len(line_sorted)):
                 prev_right = line_sorted[i - 1]["x"] + line_sorted[i - 1]["w"]
@@ -285,8 +293,8 @@ def _split_wide_blocks(blocks: List[TextBlock], img_width: int) -> List[TextBloc
                 if not placed:
                     clusters.append([sx])
 
-            # Keep splits that appear in at least half the lines
-            min_count = max(1, len(lines) // 2)
+            # Keep splits that appear in at least a third of the lines
+            min_count = max(1, len(lines) // 3)
             valid_splits = [sum(cl) / len(cl) for cl in clusters if len(cl) >= min_count]
 
             if not valid_splits:
@@ -348,9 +356,232 @@ def _safe_float(val) -> float:
 # Full-page text (for language detection)
 # ---------------------------------------------------------------------------
 
-def extract_full_text(image: Image.Image, ocr_lang: str = "eng") -> str:
+def extract_full_text(image: Image.Image, ocr_lang: str = "eng",
+                      engine: str = "auto") -> str:
     """Return all OCR'd text from a page as a single string."""
+    if engine == "auto":
+        engine = _pick_engine()
+
+    if engine == "paddleocr":
+        blocks = _extract_paddle(image, ocr_lang)
+        return " ".join(b["text"] for b in blocks if b.get("text"))
+
     configure_tesseract_path()
     pytesseract = _require_pytesseract()
     img_np = np.array(image)
     return pytesseract.image_to_string(img_np, lang=ocr_lang)
+
+
+# ---------------------------------------------------------------------------
+# PaddleOCR engine
+# ---------------------------------------------------------------------------
+
+_PADDLE_OCR_CACHE: Dict[str, Any] = {}
+
+
+def _get_paddle_ocr(lang: str = "en", device: str = "cpu"):
+    """Return a cached PaddleOCR instance for the given language."""
+    key = f"{lang}_{device}"
+    if key in _PADDLE_OCR_CACHE:
+        return _PADDLE_OCR_CACHE[key]
+
+    from paddleocr import PaddleOCR  # type: ignore
+
+    use_gpu = device != "cpu"
+    # PaddleOCR uses its own language codes (e.g. "en", "french", "ch", "japan")
+    paddle_lang = _tesseract_to_paddle_lang(lang)
+    ocr = PaddleOCR(
+        use_angle_cls=True,
+        lang=paddle_lang,
+        use_gpu=use_gpu,
+        show_log=False,
+    )
+    _PADDLE_OCR_CACHE[key] = ocr
+    log.info("PaddleOCR loaded: lang=%s device=%s", paddle_lang, device)
+    return ocr
+
+
+# Tesseract lang code → PaddleOCR lang code
+_TESS_TO_PADDLE = {
+    "eng": "en", "fra": "french", "deu": "german", "spa": "es",
+    "ita": "it", "por": "pt", "nld": "nl", "rus": "ru",
+    "chi_sim": "ch", "chi_tra": "chinese_cht", "jpn": "japan",
+    "kor": "korean", "ara": "ar", "hin": "hi", "tur": "tr",
+    "pol": "pl", "ukr": "uk", "vie": "vi", "tha": "th",
+    "tam": "ta", "tel": "te", "kan": "ka", "mar": "mr",
+    "ben": "bn", "nep": "ne", "urd": "ur", "fas": "fa",
+    "heb": "he", "swe": "sv", "nor": "no", "dan": "da",
+    "fin": "fi", "ces": "cs", "ron": "ro", "hun": "hu",
+    "bul": "bg", "hrv": "hr", "slk": "sk", "slv": "sl",
+    "srp": "rs_latin", "cat": "ca", "ell": "el",
+}
+
+
+def _tesseract_to_paddle_lang(tess_lang: str) -> str:
+    """Map Tesseract language code to PaddleOCR language code."""
+    # Handle compound codes like "eng+fra"
+    primary = tess_lang.split("+")[0].strip()
+    return _TESS_TO_PADDLE.get(primary, "en")
+
+
+def _extract_paddle(
+    image: Image.Image,
+    ocr_lang: str = "eng",
+    min_confidence: float = 0.3,
+    device: str = "cpu",
+) -> List[TextBlock]:
+    """Extract text blocks using PaddleOCR."""
+    ocr = _get_paddle_ocr(ocr_lang, device)
+    img_np = np.array(image)
+    result = ocr.ocr(img_np, cls=True)
+
+    if not result or not result[0]:
+        return []
+
+    # PaddleOCR returns: [[[box, (text, conf)], ...]]
+    # where box = [[x1,y1], [x2,y1], [x2,y2], [x1,y2]]
+    raw_lines: List[Dict[str, Any]] = []
+    for line_data in result[0]:
+        box_pts = line_data[0]
+        text, conf = line_data[1]
+        text = text.strip()
+        if not text or conf < min_confidence:
+            continue
+
+        # Convert polygon to axis-aligned bounding box
+        xs = [pt[0] for pt in box_pts]
+        ys = [pt[1] for pt in box_pts]
+        x1, y1 = int(min(xs)), int(min(ys))
+        x2, y2 = int(max(xs)), int(max(ys))
+
+        raw_lines.append({
+            "x": x1, "y": y1, "w": x2 - x1, "h": y2 - y1,
+            "x2": x2, "y2": y2,
+            "text": text,
+            "mean_conf": float(conf * 100),
+            "word_boxes": [{"x": x1, "y": y1, "w": x2 - x1, "h": y2 - y1,
+                            "x2": x2, "y2": y2, "text": text}],
+        })
+
+    if not raw_lines:
+        return []
+
+    # Group nearby lines into paragraph blocks (same logic as Tesseract path)
+    blocks = _merge_lines_into_blocks(raw_lines, image.size[0])
+    blocks = _split_wide_blocks(blocks, image.size[0])
+    return blocks
+
+
+def _merge_lines_into_blocks(
+    lines: List[TextBlock],
+    img_width: int,
+) -> List[TextBlock]:
+    """Merge adjacent text lines into paragraph-level blocks.
+
+    Used by both Tesseract and PaddleOCR paths for consistency.
+    """
+    if not lines:
+        return []
+
+    lines_sorted = sorted(lines, key=lambda b: (b["y"], b["x"]))
+    left_tolerance = max(20, int(img_width * 0.025))
+
+    blocks: List[TextBlock] = []
+    current = dict(lines_sorted[0])
+    current["word_boxes"] = list(current.get("word_boxes", []))
+    first_line_h = lines_sorted[0]["h"]
+
+    for nxt in lines_sorted[1:]:
+        gap = nxt["y"] - current["y2"]
+        left_diff = abs(nxt["x"] - current["x"])
+
+        if 0 <= gap <= first_line_h * 0.3 and left_diff <= left_tolerance:
+            current = {
+                "x":  min(current["x"],  nxt["x"]),
+                "y":  min(current["y"],  nxt["y"]),
+                "x2": max(current["x2"], nxt["x2"]),
+                "y2": max(current["y2"], nxt["y2"]),
+                "w":  max(current["x2"], nxt["x2"]) - min(current["x"], nxt["x"]),
+                "h":  max(current["y2"], nxt["y2"]) - min(current["y"], nxt["y"]),
+                "text": current["text"] + " " + nxt["text"],
+                "mean_conf": (current["mean_conf"] + nxt["mean_conf"]) / 2,
+                "word_boxes": current["word_boxes"] + nxt.get("word_boxes", []),
+            }
+        else:
+            blocks.append(current)
+            current = dict(nxt)
+            current["word_boxes"] = list(current.get("word_boxes", []))
+            first_line_h = nxt["h"]
+
+    blocks.append(current)
+    return blocks
+
+
+# ---------------------------------------------------------------------------
+# Unified interface
+# ---------------------------------------------------------------------------
+
+def _pick_engine() -> str:
+    """Auto-select OCR engine based on availability."""
+    try:
+        from paddleocr import PaddleOCR  # noqa: F401
+        return "paddleocr"
+    except Exception:
+        return "tesseract"
+
+
+def extract_text_blocks_unified(
+    image: Image.Image,
+    ocr_lang: str = "eng",
+    engine: str = "auto",
+    device: str = "cpu",
+    min_confidence: float = 20.0,
+    min_text_length: int = 2,
+    region_offset: Optional[Tuple[int, int]] = None,
+) -> List[TextBlock]:
+    """Extract text blocks using the best available engine.
+
+    Args:
+        image:          Input PIL Image (RGB).
+        ocr_lang:       Tesseract-style language string (mapped for PaddleOCR).
+        engine:         ``"paddleocr"``, ``"tesseract"``, or ``"auto"``.
+        device:         ``"cpu"`` or ``"cuda"`` (for PaddleOCR).
+        min_confidence: Minimum confidence threshold.
+        min_text_length: Minimum text length per block.
+        region_offset:  (x_offset, y_offset) to add to all coordinates when
+                        extracting from a cropped region of a larger image.
+
+    Returns:
+        List of TextBlock dicts.
+    """
+    if engine == "auto":
+        engine = _pick_engine()
+
+    if engine == "paddleocr":
+        try:
+            paddle_conf = min_confidence / 100.0 if min_confidence > 1 else min_confidence
+            blocks = _extract_paddle(image, ocr_lang, min_confidence=paddle_conf, device=device)
+        except Exception as exc:
+            log.warning("PaddleOCR failed (%s), falling back to Tesseract", exc)
+            blocks = extract_text_blocks(image, ocr_lang, min_confidence, min_text_length)
+    else:
+        blocks = extract_text_blocks(image, ocr_lang, min_confidence, min_text_length)
+
+    # Filter by text length
+    blocks = [b for b in blocks if len(b.get("text", "").replace(" ", "")) >= min_text_length]
+
+    # Apply region offset if extracting from a cropped sub-region
+    if region_offset:
+        ox, oy = region_offset
+        for b in blocks:
+            b["x"] += ox
+            b["y"] += oy
+            b["x2"] += ox
+            b["y2"] += oy
+            for wb in b.get("word_boxes", []):
+                wb["x"] += ox
+                wb["y"] += oy
+                wb["x2"] += ox
+                wb["y2"] += oy
+
+    return blocks

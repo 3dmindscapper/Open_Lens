@@ -34,6 +34,7 @@ from flask import Flask, abort, jsonify, render_template_string, request, send_f
 from werkzeug.utils import secure_filename
 
 from translator_tool.pipeline import process_document
+from translator_tool.config import TranslationConfig
 from translator_tool.file_handler import SUPPORTED_IMAGE_EXTS
 
 # ---------------------------------------------------------------------------
@@ -152,7 +153,8 @@ def _schedule_cleanup(job_id: str, delay: int = FILE_TTL_SECONDS) -> None:
 
 
 def _run_translation(job_id: str, input_path: str,
-                     target_lang: str, source_lang: str) -> None:
+                     target_lang: str, source_lang: str,
+                     config: TranslationConfig | None = None) -> None:
     """Background worker — runs the full translation pipeline."""
     with jobs_lock:
         jobs[job_id]["status"] = "running"
@@ -172,6 +174,7 @@ def _run_translation(job_id: str, input_path: str,
             source_lang=source_lang,
             verbose=False,
             log_callback=_log,
+            config=config,
         )
 
         # Resolve the actual written file(s)
@@ -246,6 +249,17 @@ def upload():
     input_path = str(UPLOAD_FOLDER / f"{job_id}_input{suffix}")
     file.save(input_path)
 
+    # Build pipeline config from optional form fields
+    config = TranslationConfig(
+        target_lang=target_lang,
+        source_lang=source_lang,
+        layout_engine=request.form.get("layout_engine", "auto").strip() or "auto",
+        ocr_engine=request.form.get("ocr_engine", "auto").strip() or "auto",
+        inpaint_engine=request.form.get("inpaint_engine", "auto").strip() or "auto",
+        translator_engine=request.form.get("translator_engine", "auto").strip() or "auto",
+        device=request.form.get("device", "auto").strip() or "auto",
+    )
+
     with jobs_lock:
         jobs[job_id] = {
             "status": "queued",
@@ -260,7 +274,7 @@ def upload():
 
     t = threading.Thread(
         target=_run_translation,
-        args=(job_id, input_path, target_lang, source_lang),
+        args=(job_id, input_path, target_lang, source_lang, config),
         daemon=True,
     )
     t.start()

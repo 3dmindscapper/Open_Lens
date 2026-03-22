@@ -1,28 +1,30 @@
 """
-Text removal via OpenCV inpainting.
+Text removal via inpainting.
 
-Strategy
---------
-1. Build a binary mask covering all text bounding boxes (with a small
-   padding so no ink bleeds through).
-2. Run cv2.inpaint (TELEA algorithm) to reconstruct the background.
-3. For predominantly uniform (white/light) backgrounds also fill regions
-   with the sampled background colour as a post-process to smooth results.
+Supports two engines:
+  - **LaMa** (default when available): deep-learning inpainting that handles
+    complex textures, stamps, watermarks, and coloured backgrounds.
+  - **OpenCV TELEA** (fallback): classical algorithm, fast, works on CPU.
+
+Both paths use word-level bounding boxes for precise mask generation.
 """
 
 from __future__ import annotations
 
+import logging
 from typing import List, Dict, Any
 
 import cv2
 import numpy as np
 from PIL import Image
 
+log = logging.getLogger(__name__)
+
 
 def remove_text_blocks(
     image: Image.Image,
     blocks: List[Dict[str, Any]],
-    padding: int = 4,
+    padding: int = 8,
     inpaint_radius: int = 5,
 ) -> Image.Image:
     """Erase text regions from *image* using inpainting.
@@ -52,13 +54,14 @@ def remove_text_blocks(
     # Build mask from word-level boxes, refined with ink detection
     mask = np.zeros((h_img, w_img), dtype=np.uint8)
     for block in blocks:
+        pad = _dynamic_padding(block, padding)
         word_boxes = block.get("word_boxes")
         boxes = word_boxes if word_boxes else [block]
         for wb in boxes:
-            x1 = max(0, wb["x"] - padding)
-            y1 = max(0, wb["y"] - padding)
-            x2 = min(w_img, wb.get("x2", wb["x"] + wb["w"]) + padding)
-            y2 = min(h_img, wb.get("y2", wb["y"] + wb["h"]) + padding)
+            x1 = max(0, wb["x"] - pad)
+            y1 = max(0, wb["y"] - pad)
+            x2 = min(w_img, wb.get("x2", wb["x"] + wb["w"]) + pad)
+            y2 = min(h_img, wb.get("y2", wb["y"] + wb["h"]) + pad)
 
             # Within the padded word box, detect actual ink pixels:
             # find the local background brightness and threshold below it.
@@ -82,14 +85,21 @@ def remove_text_blocks(
             ink_mask = np.maximum(ink_mask, color_ink)
 
             if ink_mask.any():
-                # Light dilation to cover anti-aliased edges only
-                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-                ink_mask = cv2.dilate(ink_mask, kernel, iterations=1)
-                mask[y1:y2, x1:x2] = np.maximum(mask[y1:y2, x1:x2], ink_mask)
+                # Tesseract confirmed text in this word box — always fill
+                # the entire box so no ghost fragments remain.  Partial
+                # pixel-level masking produced half-erased words when text
+                # sits over stamps, watermarks, or low-contrast areas.
+                mask[y1:y2, x1:x2] = 255
             else:
-                # No ink detected — skip this word box entirely rather
-                # than blindly filling (avoids destroying watermarks)
+                # Zero ink detected at all — likely a false-positive OCR
+                # word box over blank background.  Skip to avoid damaging
+                # watermarks or decorative elements.
                 pass
+
+    # Morphological dilation to catch anti-aliased text edges
+    if mask.any():
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        mask = cv2.dilate(mask, kernel, iterations=1)
 
     # OpenCV inpainting reconstructs the masked region from surroundings
     inpainted = cv2.inpaint(img_np, mask, inpaintRadius=inpaint_radius, flags=cv2.INPAINT_TELEA)
@@ -203,3 +213,158 @@ def _sample_border_pixels(
     border_mask = ~inner_mask
     pixels = region[border_mask].reshape(-1, region.shape[2])
     return pixels
+
+
+# ---------------------------------------------------------------------------
+# LaMa inpainting engine
+# ---------------------------------------------------------------------------
+
+_LAMA_MODEL = None
+
+
+def _get_lama_model():
+    """Return a cached SimpleLama instance."""
+    global _LAMA_MODEL
+    if _LAMA_MODEL is not None:
+        return _LAMA_MODEL
+
+    from simple_lama_inpainting import SimpleLama  # type: ignore
+
+    _LAMA_MODEL = SimpleLama()
+    log.info("LaMa inpainting model loaded")
+    return _LAMA_MODEL
+
+
+def _dynamic_padding(block: Dict[str, Any], base_padding: int = 8) -> int:
+    """Compute padding proportional to the text height in a block.
+
+    Larger text needs more padding to fully cover anti-aliased edges and
+    descenders that extend beyond the tight OCR bounding box.
+    """
+    word_boxes = block.get("word_boxes")
+    heights = []
+    if word_boxes:
+        heights = [wb.get("h", 0) for wb in word_boxes if wb.get("h", 0) > 0]
+    if not heights:
+        heights = [block.get("h", 0)]
+    avg_h = sum(heights) / len(heights) if heights else 0
+    # Scale padding: min 8px, roughly 25% of average text height
+    return max(base_padding, int(avg_h * 0.25))
+
+
+def _build_mask(
+    image: Image.Image,
+    blocks: List[Dict[str, Any]],
+    padding: int = 8,
+) -> np.ndarray:
+    """Build a binary mask covering all text regions using word-level boxes
+    and ink detection, then dilate to catch anti-aliased edges."""
+    img_np = np.array(image, dtype=np.uint8)
+    h_img, w_img = img_np.shape[:2]
+    gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+    hsv = cv2.cvtColor(img_np, cv2.COLOR_RGB2HSV)
+
+    mask = np.zeros((h_img, w_img), dtype=np.uint8)
+    for block in blocks:
+        pad = _dynamic_padding(block, padding)
+        word_boxes = block.get("word_boxes")
+        boxes = word_boxes if word_boxes else [block]
+        for wb in boxes:
+            x1 = max(0, wb["x"] - pad)
+            y1 = max(0, wb["y"] - pad)
+            x2 = min(w_img, wb.get("x2", wb["x"] + wb["w"]) + pad)
+            y2 = min(h_img, wb.get("y2", wb["y"] + wb["h"]) + pad)
+
+            roi_gray = gray[y1:y2, x1:x2]
+            if roi_gray.size == 0:
+                continue
+
+            bg_bright = np.percentile(roi_gray, 90)
+            ink_thresh = bg_bright - 40
+            ink_mask = (roi_gray < ink_thresh).astype(np.uint8) * 255
+
+            roi_sat = hsv[y1:y2, x1:x2, 1]
+            bg_sat = np.percentile(roi_sat, 15)
+            sat_thresh = max(bg_sat + 60, 70)
+            color_ink = (roi_sat > sat_thresh).astype(np.uint8) * 255
+            ink_mask = np.maximum(ink_mask, color_ink)
+
+            if ink_mask.any():
+                mask[y1:y2, x1:x2] = 255
+
+    # Morphological dilation to catch anti-aliased text edges and any
+    # remaining ink fragments just outside the padded bounding boxes.
+    if mask.any():
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        mask = cv2.dilate(mask, kernel, iterations=1)
+
+    return mask
+
+
+def remove_text_lama(
+    image: Image.Image,
+    blocks: List[Dict[str, Any]],
+    padding: int = 8,
+) -> Image.Image:
+    """Remove text using LaMa deep-learning inpainting."""
+    if not blocks:
+        return image.copy()
+
+    mask_np = _build_mask(image, blocks, padding)
+
+    if not mask_np.any():
+        return image.copy()
+
+    lama = _get_lama_model()
+
+    # SimpleLama expects PIL Images
+    mask_pil = Image.fromarray(mask_np).convert("L")
+    result = lama(image.convert("RGB"), mask_pil)
+
+    # Post-process uniform backgrounds (same as TELEA path)
+    result_np = np.array(result, dtype=np.uint8)
+    result_np = _smooth_uniform_backgrounds(result_np, blocks, mask_np, padding)
+
+    return Image.fromarray(result_np)
+
+
+# ---------------------------------------------------------------------------
+# Unified interface
+# ---------------------------------------------------------------------------
+
+def remove_text(
+    image: Image.Image,
+    blocks: List[Dict[str, Any]],
+    engine: str = "auto",
+    padding: int = 8,
+    inpaint_radius: int = 5,
+) -> Image.Image:
+    """Remove text regions using the best available engine.
+
+    Args:
+        image:          RGB PIL Image.
+        blocks:         Text block dicts with bounding boxes.
+        engine:         ``"lama"``, ``"telea"``, or ``"auto"``.
+        padding:        Pixel padding around word boxes.
+        inpaint_radius: Radius for TELEA inpainting (ignored by LaMa).
+
+    Returns:
+        A new PIL Image with text regions erased.
+    """
+    if not blocks:
+        return image.copy()
+
+    if engine == "auto":
+        try:
+            from simple_lama_inpainting import SimpleLama  # noqa: F401
+            engine = "lama"
+        except Exception:
+            engine = "telea"
+
+    if engine == "lama":
+        try:
+            return remove_text_lama(image, blocks, padding)
+        except Exception as exc:
+            log.warning("LaMa inpainting failed (%s), falling back to TELEA", exc)
+
+    return remove_text_blocks(image, blocks, padding, inpaint_radius)

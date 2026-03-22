@@ -2,10 +2,13 @@
 Translated text rendering.
 
 For each block:
-  1. Sample the original text colour from the pre-inpainted image.
-  2. Auto-fit a TrueType font so the translated string fills the bbox.
-  3. Wrap the text across multiple lines if needed.
-  4. Handle RTL languages via python-bidi + arabic-reshaper (optional).
+  1. Sample the original text colour via k-means clustering.
+  2. Detect font weight via stroke-width analysis.
+  3. Detect text alignment (left / centre / right).
+  4. Calibrate font size using rendered glyph height comparison.
+  5. Measure original line spacing and reproduce it.
+  6. Auto-fit translated text with word wrapping.
+  7. Handle RTL languages via python-bidi + arabic-reshaper (optional).
 """
 
 from __future__ import annotations
@@ -18,6 +21,13 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 from .language_utils import is_rtl
+from .font_analyzer import (
+    extract_text_color,
+    detect_font_weight,
+    detect_alignment,
+    measure_line_spacing,
+    calibrate_font_size,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -190,88 +200,33 @@ def _fit_font(
     return font, lines, min_size
 
 
-def _estimate_original_font_size(block: Dict[str, Any]) -> Optional[int]:
-    """Estimate original font size from word-level OCR bounding boxes.
+def _estimate_original_font_size(block: Dict[str, Any], font_path: Optional[str] = None) -> Optional[int]:
+    """Estimate original font size using glyph-height calibration.
 
-    Uses the 25th-percentile word height (conservative) scaled down to
-    account for OCR bbox padding, ascenders/descenders, and the tendency
-    of Tesseract boxes to be taller than the visual font size.
+    Delegates to :func:`font_analyzer.calibrate_font_size` which binary-searches
+    for the font size whose rendered height matches the OCR bounding box height.
     """
-    word_boxes = block.get("word_boxes", [])
-    if not word_boxes:
-        return None
-    heights = sorted(wb["h"] for wb in word_boxes if wb.get("h", 0) > 0)
-    if not heights:
-        return None
-    # Use 25th percentile (robust against outlier tall boxes from
-    # watermarks, stamps, or ascender-heavy characters).
-    p25_idx = max(0, len(heights) // 4)
-    ref_h = heights[p25_idx]
-    return max(6, int(ref_h * 0.60))
+    return calibrate_font_size(block, font_path)
 
 
 # ---------------------------------------------------------------------------
-# Colour sampling
+# Colour sampling  (delegates to font_analyzer)
 # ---------------------------------------------------------------------------
 
 def _sample_text_color(
     original_image: Image.Image,
     block: Dict[str, Any],
 ) -> Tuple[int, int, int]:
-    """Estimate the ink colour in a block by finding the darkest pixel cluster."""
-    x, y, x2, y2 = block["x"], block["y"], block["x2"], block["y2"]
-    region = np.array(original_image.crop((x, y, x2, y2)))
-
-    if region.size == 0:
-        return (0, 0, 0)
-
-    # Grayscale brightness
-    gray = 0.299 * region[:, :, 0] + 0.587 * region[:, :, 1] + 0.114 * region[:, :, 2]
-    threshold = np.percentile(gray, 20)  # bottom 20 % = ink
-    dark_mask = gray < threshold
-
-    if dark_mask.sum() < 5:
-        return (0, 0, 0)
-
-    dark_pixels = region[dark_mask]
-    colour = tuple(np.median(dark_pixels, axis=0).astype(int)[:3])
-    return colour  # type: ignore[return-value]
+    """Extract ink colour via k-means clustering."""
+    return extract_text_color(original_image, block)
 
 
-def _detect_font_weight(
+def _detect_font_weight_legacy(
     original_image: Image.Image,
     block: Dict[str, Any],
 ) -> str:
-    """Detect whether the original text appears bold or italic.
-
-    Returns ``"bold"``, ``"italic"``, or ``"regular"``.
-
-    Heuristic: bold text has thicker strokes, so the proportion of dark
-    pixels in the bounding box is higher.  ALL-CAPS text with high ink
-    density is also a strong bold signal.
-    """
-    x, y, x2, y2 = block["x"], block["y"], block["x2"], block["y2"]
-    region = np.array(original_image.crop((x, y, x2, y2)))
-    if region.size == 0:
-        return "regular"
-
-    gray = 0.299 * region[:, :, 0] + 0.587 * region[:, :, 1] + 0.114 * region[:, :, 2]
-    bg_bright = np.percentile(gray, 85)
-    ink_mask = gray < (bg_bright - 30)
-    ink_ratio = ink_mask.sum() / max(gray.size, 1)
-
-    text = block.get("text", "")
-    is_upper = text == text.upper() and len(text) > 3
-
-    # Bold: high ink density or ALL-CAPS header
-    if ink_ratio > 0.25 or (is_upper and ink_ratio > 0.15):
-        return "bold"
-
-    # Italic: very low ink density with narrow strokes (heuristic)
-    if ink_ratio < 0.08 and not is_upper:
-        return "italic"
-
-    return "regular"
+    """Detect bold/italic via stroke-width analysis."""
+    return detect_font_weight(original_image, block)
 
 
 # ---------------------------------------------------------------------------
@@ -325,6 +280,7 @@ def render_translated_blocks(
 
     result = image.copy()
     draw = ImageDraw.Draw(result)
+    img_width = image.size[0]
 
     rtl = is_rtl(target_lang)
 
@@ -336,18 +292,17 @@ def render_translated_blocks(
         x, y = block["x"], block["y"]
         w, h = block["w"], block["h"]
 
-        # Determine text colour
+        # --- Colour ---
         if original_image is not None:
             text_color = _sample_text_color(original_image, block)
         else:
             text_color = default_text_color
 
-        # Detect font weight from original image
+        # --- Font weight ---
         weight = "regular"
         if original_image is not None:
-            weight = _detect_font_weight(original_image, block)
+            weight = _detect_font_weight_legacy(original_image, block)
 
-        # Pick font variant
         if weight == "bold" and bold_font_path:
             active_font_path = bold_font_path
         elif weight == "italic" and italic_font_path:
@@ -355,34 +310,59 @@ def render_translated_blocks(
         else:
             active_font_path = font_path
 
-        # Prepare text (RTL reshaping if needed)
+        # --- RTL ---
         display_text = _prepare_rtl_text(translated.strip(), target_lang)
 
-        # Estimate original font size from word bounding box heights (most
-        # reliable) to avoid blowing up text larger than the original.
-        estimated_size = _estimate_original_font_size(block)
+        # --- Font size (calibrated) ---
+        estimated_size = _estimate_original_font_size(block, active_font_path)
         if estimated_size is None:
             original_text = block.get("text", "")
             if original_text and original_text.strip():
                 _, _, estimated_size = _fit_font(original_text.strip(), w, h, active_font_path)
 
-        # Fit translated text, capped at the original visual font size
-        font, lines, font_size = _fit_font(display_text, w, h, active_font_path, max_size=estimated_size)
+        # --- Alignment ---
+        alignment = detect_alignment(block, img_width)
+        if rtl:
+            alignment = "right"
 
-        # Compute line height with tight spacing to match document formatting
-        _, line_h = _text_bbox("Ag", font)
-        line_spacing = line_h + 2
+        # --- Line spacing ---
+        original_spacing = measure_line_spacing(block)
 
-        # Top-align text within the bounding box (matches document formatting)
-        current_y = y
+        # Allow up to 60% extra height for longer translations
+        fit_h = int(h * 1.6)
+        min_font = max(6, int(estimated_size * 0.70)) if estimated_size else 6
+        font, lines, font_size = _fit_font(
+            display_text, w, fit_h, active_font_path,
+            min_size=min_font, max_size=estimated_size,
+        )
+
+        # Line height: use measured original spacing if available
+        _, glyph_h = _text_bbox("Ag", font)
+        if original_spacing and original_spacing > glyph_h:
+            line_spacing = int(original_spacing)
+        else:
+            line_spacing = glyph_h + 2
+
+        # --- Vertical positioning ---
+        total_text_h = line_spacing * len(lines)
+        # Top-align by default; centre if block is significantly taller
+        if total_text_h < h * 0.7 and len(lines) == 1:
+            # Centre single short lines vertically
+            current_y = y + (h - total_text_h) // 2
+        else:
+            current_y = y
+
+        overflow_limit = y + h + int(h * 0.6)
 
         for line in lines:
-            if current_y + line_h > y + h:
-                break  # strict overflow – don't draw past bounding box
+            if current_y + glyph_h > overflow_limit:
+                break
 
-            if rtl:
-                line_w, _ = _text_bbox(line, font)
-                draw_x = x + w - line_w  # right-align for RTL
+            line_w, _ = _text_bbox(line, font)
+            if alignment == "right":
+                draw_x = x + w - line_w
+            elif alignment == "center":
+                draw_x = x + (w - line_w) // 2
             else:
                 draw_x = x
 

@@ -75,6 +75,64 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Suppress progress output.",
     )
+
+    # --- Engine selection ---------------------------------------------------
+    engine_group = p.add_argument_group("Engine selection (auto-detected by default)")
+    engine_group.add_argument(
+        "--layout-engine",
+        default="auto",
+        choices=["auto", "layoutparser", "paddleocr", "none"],
+        dest="layout_engine",
+        help="Layout detection engine (default: auto).",
+    )
+    engine_group.add_argument(
+        "--ocr-engine",
+        default="auto",
+        choices=["auto", "paddleocr", "tesseract"],
+        dest="ocr_engine",
+        help="OCR engine (default: auto — prefers PaddleOCR).",
+    )
+    engine_group.add_argument(
+        "--inpaint-engine",
+        default="auto",
+        choices=["auto", "lama", "telea"],
+        dest="inpaint_engine",
+        help="Inpainting engine (default: auto — prefers LaMa).",
+    )
+    engine_group.add_argument(
+        "--translator",
+        default="auto",
+        choices=["auto", "argos", "ollama"],
+        dest="translator_engine",
+        help="Translation engine (default: auto — uses Argos Translate).",
+    )
+    engine_group.add_argument(
+        "--device",
+        default="auto",
+        choices=["auto", "cuda", "cpu"],
+        help="Compute device (default: auto).",
+    )
+    engine_group.add_argument(
+        "--ollama-url",
+        default="http://localhost:11434",
+        metavar="URL",
+        dest="ollama_url",
+        help="Ollama server URL (default: http://localhost:11434).",
+    )
+    engine_group.add_argument(
+        "--ollama-model",
+        default="qwen2.5:7b",
+        metavar="MODEL",
+        dest="ollama_model",
+        help="Ollama model name (default: qwen2.5:7b).",
+    )
+    engine_group.add_argument(
+        "--glossary",
+        default=None,
+        metavar="PATH",
+        dest="glossary_path",
+        help="Path to a TSV glossary file (source_term<TAB>target_term).",
+    )
     return p
 
 
@@ -89,9 +147,25 @@ def main(argv=None):
     # Import here so startup is fast even if deps are missing
     try:
         from .pipeline import process_document
+        from .config import TranslationConfig
     except ImportError as exc:
         print(f"[ERROR] Missing dependency: {exc}", file=sys.stderr)
         sys.exit(1)
+
+    config = TranslationConfig(
+        layout_engine=args.layout_engine,
+        ocr_engine=args.ocr_engine,
+        inpaint_engine=args.inpaint_engine,
+        translator_engine=args.translator_engine,
+        device=args.device,
+        target_lang=args.target_lang,
+        source_lang=args.source_lang,
+        tesseract_cmd=args.tesseract_cmd,
+        font_path=args.font_path,
+        ollama_url=args.ollama_url,
+        ollama_model=args.ollama_model,
+        glossary_path=args.glossary_path,
+    )
 
     try:
         out = process_document(
@@ -102,6 +176,7 @@ def main(argv=None):
             tesseract_cmd=args.tesseract_cmd,
             font_path=args.font_path,
             verbose=not args.quiet,
+            config=config,
         )
         if args.quiet:
             print(out)
