@@ -28,8 +28,9 @@ Multi-page PDFs are converted page-by-page at 200 DPI, processed individually, a
 ## Requirements
 
 - **Python 3.10+**
-- **Tesseract OCR** — [Windows installer](https://github.com/UB-Mannheim/tesseract/wiki) · `brew install tesseract` (macOS) · `sudo apt install tesseract-ocr` (Linux)
-- **Poppler** — Included in this repository under `poppler-25.12.0/`. Required for PDF support.
+- **Tesseract OCR** — [Windows installer](https://github.com/UB-Mannheim/tesseract/wiki) · `brew install tesseract` (macOS) · `sudo apt install tesseract-ocr` (Linux / Chrome OS)
+- **Poppler** — Bundled for Windows under `poppler-25.12.0/`. On other platforms install via `brew install poppler` (macOS) or `sudo apt install poppler-utils` (Linux / Chrome OS). Required for PDF support.
+- **Tkinter** (Linux / Chrome OS only, if using the GUI) — `sudo apt install python3-tk`
 
 Python dependencies (installed via pip):
 
@@ -45,11 +46,18 @@ Optional for RTL languages: `arabic-reshaper`, `python-bidi`.
 
 ### GUI
 
-Double-click **Launch Translator.bat** or run:
+**Windows** — Double-click **Launch Translator.bat** or run:
 
 ```bash
 cd Open_Lens_Core
 python translator_ui.py
+```
+
+**macOS / Linux / Chrome OS** — Run the provided shell script (make it executable once, then double-click or run from the terminal):
+
+```bash
+chmod +x scripts/launch_translator.sh
+bash scripts/launch_translator.sh
 ```
 
 The GUI defaults to translating to **English** with automatic source language detection. Select a different target language from the dropdown if needed.
@@ -86,6 +94,9 @@ python translate.py invoice.png -t es --tesseract "C:\Program Files\Tesseract-OC
 Open_Lens/
 ├── Launch Translator.bat          # Windows launcher for the desktop GUI
 ├── Launch Web Server.bat          # Windows launcher for the web server
+├── scripts/
+│   ├── launch_translator.sh       # macOS / Linux / Chrome OS launcher for the GUI
+│   └── launch_web_server.sh       # macOS / Linux / Chrome OS launcher for the web server
 ├── README.md                      # This file
 ├── Open_Lens_Core/
 │   ├── translate.py               # CLI entry point
@@ -116,11 +127,18 @@ Translation between any pair is handled directly if a model exists, or via Engli
 
 ### Starting the server
 
-Double-click **Launch Web Server.bat**, or run manually:
+**Windows** — Double-click **Launch Web Server.bat**, or run manually:
 
 ```bash
 cd Open_Lens_Core
 python web_app.py
+```
+
+**macOS / Linux / Chrome OS** — Use the provided shell script:
+
+```bash
+chmod +x scripts/launch_web_server.sh
+bash scripts/launch_web_server.sh
 ```
 
 The console prints two URLs:
@@ -151,8 +169,12 @@ By default the server only works on your local network. To expose it over the in
 Set the `PORT` environment variable before launching:
 
 ```bash
+# Windows
 set PORT=8080
 python web_app.py
+
+# macOS / Linux / Chrome OS
+PORT=8080 python3 web_app.py
 ```
 
 ## License
