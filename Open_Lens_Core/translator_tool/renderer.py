@@ -35,6 +35,23 @@ _WINDOWS_FONT_CANDIDATES = [
     r"C:\Windows\Fonts\times.ttf",
 ]
 
+_WINDOWS_BOLD_FONT_CANDIDATES = [
+    r"C:\Windows\Fonts\arialbd.ttf",
+    r"C:\Windows\Fonts\calibrib.ttf",
+    r"C:\Windows\Fonts\tahomabd.ttf",
+    r"C:\Windows\Fonts\segoeuib.ttf",
+    r"C:\Windows\Fonts\verdanab.ttf",
+    r"C:\Windows\Fonts\timesbd.ttf",
+]
+
+_WINDOWS_ITALIC_FONT_CANDIDATES = [
+    r"C:\Windows\Fonts\ariali.ttf",
+    r"C:\Windows\Fonts\calibrii.ttf",
+    r"C:\Windows\Fonts\segoeuii.ttf",
+    r"C:\Windows\Fonts\verdanai.ttf",
+    r"C:\Windows\Fonts\timesi.ttf",
+]
+
 _LINUX_FONT_CANDIDATES = [
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
@@ -58,6 +75,30 @@ def find_system_font() -> Optional[str]:
     else:
         candidates = _LINUX_FONT_CANDIDATES
 
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def _find_bold_font() -> Optional[str]:
+    """Return path to a bold system font, or None."""
+    if sys.platform == "win32":
+        candidates = _WINDOWS_BOLD_FONT_CANDIDATES
+    else:
+        return None  # TODO: add Linux/macOS bold candidates
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def _find_italic_font() -> Optional[str]:
+    """Return path to an italic system font, or None."""
+    if sys.platform == "win32":
+        candidates = _WINDOWS_ITALIC_FONT_CANDIDATES
+    else:
+        return None
     for path in candidates:
         if os.path.exists(path):
             return path
@@ -130,11 +171,13 @@ def _fit_font(
         # Start from the height of the box as an upper bound
         max_size = max(max_height, 12)
 
+    # Use a step-based search for speed: try larger steps first, then refine
+    best = None
     for size in range(max_size, min_size - 1, -1):
         font = _load_font(font_path, size)
         lines = _wrap_text(text, font, max_width)
         _, line_h = _text_bbox("Ag", font)
-        line_spacing = max(line_h + 2, int(size * 1.2))
+        line_spacing = line_h + 2
         total_h = line_spacing * len(lines)
         max_line_w = max((_text_bbox(ln, font)[0] for ln in lines), default=0)
 
@@ -145,6 +188,26 @@ def _fit_font(
     font = _load_font(font_path, min_size)
     lines = _wrap_text(text, font, max_width)
     return font, lines, min_size
+
+
+def _estimate_original_font_size(block: Dict[str, Any]) -> Optional[int]:
+    """Estimate original font size from word-level OCR bounding boxes.
+
+    Uses the 25th-percentile word height (conservative) scaled down to
+    account for OCR bbox padding, ascenders/descenders, and the tendency
+    of Tesseract boxes to be taller than the visual font size.
+    """
+    word_boxes = block.get("word_boxes", [])
+    if not word_boxes:
+        return None
+    heights = sorted(wb["h"] for wb in word_boxes if wb.get("h", 0) > 0)
+    if not heights:
+        return None
+    # Use 25th percentile (robust against outlier tall boxes from
+    # watermarks, stamps, or ascender-heavy characters).
+    p25_idx = max(0, len(heights) // 4)
+    ref_h = heights[p25_idx]
+    return max(6, int(ref_h * 0.60))
 
 
 # ---------------------------------------------------------------------------
@@ -173,6 +236,42 @@ def _sample_text_color(
     dark_pixels = region[dark_mask]
     colour = tuple(np.median(dark_pixels, axis=0).astype(int)[:3])
     return colour  # type: ignore[return-value]
+
+
+def _detect_font_weight(
+    original_image: Image.Image,
+    block: Dict[str, Any],
+) -> str:
+    """Detect whether the original text appears bold or italic.
+
+    Returns ``"bold"``, ``"italic"``, or ``"regular"``.
+
+    Heuristic: bold text has thicker strokes, so the proportion of dark
+    pixels in the bounding box is higher.  ALL-CAPS text with high ink
+    density is also a strong bold signal.
+    """
+    x, y, x2, y2 = block["x"], block["y"], block["x2"], block["y2"]
+    region = np.array(original_image.crop((x, y, x2, y2)))
+    if region.size == 0:
+        return "regular"
+
+    gray = 0.299 * region[:, :, 0] + 0.587 * region[:, :, 1] + 0.114 * region[:, :, 2]
+    bg_bright = np.percentile(gray, 85)
+    ink_mask = gray < (bg_bright - 30)
+    ink_ratio = ink_mask.sum() / max(gray.size, 1)
+
+    text = block.get("text", "")
+    is_upper = text == text.upper() and len(text) > 3
+
+    # Bold: high ink density or ALL-CAPS header
+    if ink_ratio > 0.25 or (is_upper and ink_ratio > 0.15):
+        return "bold"
+
+    # Italic: very low ink density with narrow strokes (heuristic)
+    if ink_ratio < 0.08 and not is_upper:
+        return "italic"
+
+    return "regular"
 
 
 # ---------------------------------------------------------------------------
@@ -221,6 +320,9 @@ def render_translated_blocks(
     if font_path is None:
         font_path = find_system_font()
 
+    bold_font_path = _find_bold_font()
+    italic_font_path = _find_italic_font()
+
     result = image.copy()
     draw = ImageDraw.Draw(result)
 
@@ -240,20 +342,43 @@ def render_translated_blocks(
         else:
             text_color = default_text_color
 
+        # Detect font weight from original image
+        weight = "regular"
+        if original_image is not None:
+            weight = _detect_font_weight(original_image, block)
+
+        # Pick font variant
+        if weight == "bold" and bold_font_path:
+            active_font_path = bold_font_path
+        elif weight == "italic" and italic_font_path:
+            active_font_path = italic_font_path
+        else:
+            active_font_path = font_path
+
         # Prepare text (RTL reshaping if needed)
         display_text = _prepare_rtl_text(translated.strip(), target_lang)
 
-        # Find best fitting font + wrapping
-        font, lines, font_size = _fit_font(display_text, w, h, font_path)
+        # Estimate original font size from word bounding box heights (most
+        # reliable) to avoid blowing up text larger than the original.
+        estimated_size = _estimate_original_font_size(block)
+        if estimated_size is None:
+            original_text = block.get("text", "")
+            if original_text and original_text.strip():
+                _, _, estimated_size = _fit_font(original_text.strip(), w, h, active_font_path)
 
-        # Compute line height with spacing
+        # Fit translated text, capped at the original visual font size
+        font, lines, font_size = _fit_font(display_text, w, h, active_font_path, max_size=estimated_size)
+
+        # Compute line height with tight spacing to match document formatting
         _, line_h = _text_bbox("Ag", font)
-        line_spacing = max(line_h + 2, int(font_size * 1.2))
+        line_spacing = line_h + 2
 
+        # Top-align text within the bounding box (matches document formatting)
         current_y = y
+
         for line in lines:
-            if current_y + line_spacing > y + h + line_spacing:
-                break  # overflow – stop drawing
+            if current_y + line_h > y + h:
+                break  # strict overflow – don't draw past bounding box
 
             if rtl:
                 line_w, _ = _text_bbox(line, font)

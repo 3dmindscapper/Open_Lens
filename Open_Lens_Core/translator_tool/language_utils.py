@@ -316,6 +316,55 @@ def _get_translation_fn(from_code: str, to_code: str, log=print):
     return None
 
 
+# Characters commonly used as list bullets / checkmarks in documents.
+# These are preserved as-is during translation so they aren't lost or
+# corrupted by the translation engine.
+_BULLET_RE = re.compile(
+    r'^(\s*[\u2713\u2714\u2715\u2716\u2717\u2718'
+    r'\u2610\u2611\u2612\u2022\u25cf\u25cb\u25a0\u25a1'
+    r'\u25b6\u25b8\u25b9\u25bb\u27a4\u279c\u2794\u2192\u21d2'
+    r'\u2219\u00b7\u2043\u2013\u2014\u2023\u2039\u203a'
+    r'\u25aa\u25ab\u29bf\u2756\*\-]\s*)+'
+)
+
+
+def _split_bullet_prefix(text: str):
+    """Split leading bullet / checkmark characters from the translatable body."""
+    m = _BULLET_RE.match(text)
+    if m:
+        return m.group(0), text[m.end():]
+    return "", text
+
+
+def _post_process_translation(text: str, source_lang: str, target_lang: str) -> str:
+    """Fix common translation artefacts.
+
+    Argos Translate sometimes leaves source-language words untranslated or
+    produces hallucinations on short fragments.  This function applies
+    targeted corrections for known patterns.
+    """
+    if not text:
+        return text
+
+    # Case-insensitive whole-word replacements: source word → {target_lang: replacement}
+    _FIXUPS: Dict[str, Dict[str, str]] = {
+        r'\bdiplome\b':       {"en": "diploma", "es": "diploma", "de": "Diplom", "it": "diploma", "pt": "diploma"},
+        r'\bdiplôme\b':       {"en": "diploma", "es": "diploma", "de": "Diplom", "it": "diploma", "pt": "diploma"},
+        r'\bDIPLOME\b':       {"en": "DIPLOMA", "es": "DIPLOMA", "de": "DIPLOM", "it": "DIPLOMA", "pt": "DIPLOMA"},
+        r'\bDIPLÔME\b':      {"en": "DIPLOMA", "es": "DIPLOMA", "de": "DIPLOM", "it": "DIPLOMA", "pt": "DIPLOMA"},
+        r'\btitulaire\b':     {"en": "holder", "es": "titular", "de": "Inhaber", "it": "titolare", "pt": "titular"},
+        r'\bTITULAIRE\b':    {"en": "HOLDER", "es": "TITULAR", "de": "INHABER", "it": "TITOLARE", "pt": "TITULAR"},
+        r'\bhelic[oó]ptero\b': {"en": "holder", "es": "titular", "de": "Inhaber", "it": "titolare", "pt": "titular"},
+    }
+
+    tl = target_lang.lower().split("-")[0]
+    for pattern, replacements in _FIXUPS.items():
+        if tl in replacements:
+            text = re.sub(pattern, replacements[tl], text, flags=re.IGNORECASE)
+
+    return text
+
+
 def translate_blocks(
     blocks: List[Dict[str, Any]],
     target_lang: str,
@@ -352,8 +401,16 @@ def translate_blocks(
     log(f"    [translate] Translating {len(blocks)} block(s) …")
     for block in blocks:
         try:
-            result = translate_fn(block["text"])
-            block["translated_text"] = result if result else block["text"]
+            prefix, body = _split_bullet_prefix(block["text"])
+            if body.strip():
+                result = translate_fn(body)
+                if result:
+                    result = _post_process_translation(result, from_code, to_code)
+                    block["translated_text"] = prefix + result
+                else:
+                    block["translated_text"] = block["text"]
+            else:
+                block["translated_text"] = block["text"]
         except Exception as exc:
             log(f"    [translate] Block failed: {exc}")
             block["translated_text"] = block["text"]
